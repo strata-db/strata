@@ -8,17 +8,17 @@ import (
 	"github.com/makhov/strata/internal/object"
 )
 
-func newLock(t *testing.T, nodeID, addr string, ttl time.Duration) *Lock {
+func newLock(t *testing.T, nodeID, addr string) *Lock {
 	t.Helper()
-	return NewLock(object.NewMem(), nodeID, addr, ttl)
+	return NewLock(object.NewMem(), nodeID, addr)
 }
 
-func newLockShared(store *object.Mem, nodeID, addr string, ttl time.Duration) *Lock {
-	return NewLock(store, nodeID, addr, ttl)
+func newLockShared(store *object.Mem, nodeID, addr string) *Lock {
+	return NewLock(store, nodeID, addr)
 }
 
 func TestTryAcquireEmpty(t *testing.T) {
-	l := newLock(t, "node-1", "localhost:2380", 30*time.Second)
+	l := newLock(t, "node-1", "localhost:2380")
 	rec, won, err := l.TryAcquire(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("TryAcquire: %v", err)
@@ -35,7 +35,7 @@ func TestTryAcquireEmpty(t *testing.T) {
 }
 
 func TestTryAcquireFloorTerm(t *testing.T) {
-	l := newLock(t, "node-1", "localhost:2380", 30*time.Second)
+	l := newLock(t, "node-1", "localhost:2380")
 	rec, won, err := l.TryAcquire(context.Background(), 5)
 	if err != nil || !won {
 		t.Fatalf("TryAcquire: won=%v err=%v", won, err)
@@ -47,15 +47,15 @@ func TestTryAcquireFloorTerm(t *testing.T) {
 
 func TestTwoNodeElection(t *testing.T) {
 	store := object.NewMem()
-	l1 := newLockShared(store, "node-1", "localhost:2380", 30*time.Second)
-	l2 := newLockShared(store, "node-2", "localhost:2381", 30*time.Second)
+	l1 := newLockShared(store, "node-1", "localhost:2380")
+	l2 := newLockShared(store, "node-2", "localhost:2381")
 
 	_, won1, err := l1.TryAcquire(context.Background(), 0)
 	if err != nil || !won1 {
 		t.Fatalf("node-1 should win: won=%v err=%v", won1, err)
 	}
 
-	// node-2 tries while node-1 holds a valid lease → should lose.
+	// node-2 tries while node-1 holds the lock → should lose.
 	existing, won2, err := l2.TryAcquire(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("node-2 TryAcquire: %v", err)
@@ -68,68 +68,82 @@ func TestTwoNodeElection(t *testing.T) {
 	}
 }
 
-func TestExpiredLockAllowsTakeover(t *testing.T) {
+func TestTakeOverAfterLeaderDead(t *testing.T) {
 	store := object.NewMem()
-	// node-1 acquires with a very short TTL.
-	l1 := newLockShared(store, "node-1", "localhost:2380", 10*time.Millisecond)
-	_, won1, _ := l1.TryAcquire(context.Background(), 0)
-	if !won1 {
-		t.Fatal("node-1 should win")
+	l1 := newLockShared(store, "node-1", "localhost:2380")
+	l2 := newLockShared(store, "node-2", "localhost:2381")
+
+	// node-1 acquires.
+	rec1, won1, err := l1.TryAcquire(context.Background(), 0)
+	if err != nil || !won1 {
+		t.Fatalf("node-1 should win: %v", err)
 	}
 
-	// Wait for lease to expire.
-	time.Sleep(50 * time.Millisecond)
+	// node-2 cannot acquire normally (node-1 still holds it, no TTL).
+	_, won2, err := l2.TryAcquire(context.Background(), 0)
+	if err != nil || won2 {
+		t.Fatalf("node-2 should lose TryAcquire: won=%v err=%v", won2, err)
+	}
 
-	// node-2 should now be able to acquire.
-	l2 := newLockShared(store, "node-2", "localhost:2381", 30*time.Second)
-	rec, won2, err := l2.TryAcquire(context.Background(), 0)
+	// Simulate: node-2 detects leader dead via stream → calls TakeOver.
+	rec2, won2, err := l2.TakeOver(context.Background(), rec1.Term)
 	if err != nil {
-		t.Fatalf("node-2 TryAcquire: %v", err)
+		t.Fatalf("TakeOver: %v", err)
 	}
 	if !won2 {
-		t.Errorf("node-2 should win after node-1 lease expires; existing=%+v", rec)
+		t.Error("node-2 should win TakeOver after leader is dead")
 	}
-	if won2 && rec.NodeID != "node-2" {
-		t.Errorf("expected node-2 to hold the lock, got %q", rec.NodeID)
+	if rec2.NodeID != "node-2" {
+		t.Errorf("expected node-2 to hold the lock, got %q", rec2.NodeID)
 	}
-}
-
-func TestRenew(t *testing.T) {
-	l := newLock(t, "node-1", "localhost:2380", 30*time.Second)
-	rec, _, _ := l.TryAcquire(context.Background(), 0)
-
-	before := rec.ExpiresAt
-	time.Sleep(5 * time.Millisecond)
-
-	if err := l.Renew(context.Background(), rec.Term); err != nil {
-		t.Fatalf("Renew: %v", err)
-	}
-
-	renewed, _ := l.Read(context.Background())
-	if !renewed.ExpiresAt.After(before) {
-		t.Error("ExpiresAt should advance after renewal")
+	if rec2.Term <= rec1.Term {
+		t.Errorf("new term %d should be > old term %d", rec2.Term, rec1.Term)
 	}
 }
 
-func TestRenewStolenLock(t *testing.T) {
+func TestTakeOverRace(t *testing.T) {
+	// Two followers simultaneously attempt TakeOver — exactly one should win.
 	store := object.NewMem()
-	l1 := newLockShared(store, "node-1", "addr1", 10*time.Millisecond)
-	l2 := newLockShared(store, "node-2", "addr2", 30*time.Second)
+	l1 := newLockShared(store, "leader", "localhost:2380")
+	_, won, _ := l1.TryAcquire(context.Background(), 0)
+	if !won {
+		t.Fatal("leader should win initial election")
+	}
 
-	rec, _, _ := l1.TryAcquire(context.Background(), 0)
-	time.Sleep(50 * time.Millisecond) // let l1's lease expire
-	l2.TryAcquire(context.Background(), 0)
+	f1 := newLockShared(store, "follower-1", "localhost:2381")
+	f2 := newLockShared(store, "follower-2", "localhost:2382")
 
-	// l1 tries to renew but its lock was stolen.
-	err := l1.Renew(context.Background(), rec.Term)
-	if err == nil {
-		t.Error("expected error renewing a stolen lock")
+	type result struct {
+		rec *LockRecord
+		won bool
+	}
+	ch := make(chan result, 2)
+	go func() {
+		rec, won, _ := f1.TakeOver(context.Background(), 1)
+		ch <- result{rec, won}
+	}()
+	go func() {
+		rec, won, _ := f2.TakeOver(context.Background(), 1)
+		ch <- result{rec, won}
+	}()
+
+	r1 := <-ch
+	r2 := <-ch
+	wins := 0
+	if r1.won {
+		wins++
+	}
+	if r2.won {
+		wins++
+	}
+	if wins != 1 {
+		t.Errorf("expected exactly 1 winner, got %d (r1.won=%v r2.won=%v)", wins, r1.won, r2.won)
 	}
 }
 
 func TestRelease(t *testing.T) {
 	store := object.NewMem()
-	l1 := newLockShared(store, "node-1", "addr1", 30*time.Second)
+	l1 := newLockShared(store, "node-1", "addr1")
 	_, _, _ = l1.TryAcquire(context.Background(), 0)
 
 	if err := l1.Release(context.Background()); err != nil {
@@ -150,15 +164,42 @@ func TestTermMonotonicity(t *testing.T) {
 	store := object.NewMem()
 	var lastTerm uint64
 	for i := 0; i < 5; i++ {
-		l := newLockShared(store, "node-1", "addr", 1*time.Millisecond)
-		time.Sleep(5 * time.Millisecond)
-		rec, won, err := l.TryAcquire(context.Background(), lastTerm)
+		// Simulate a takeover on each iteration.
+		l := newLockShared(store, "node-1", "addr")
+		time.Sleep(time.Millisecond) // ensure distinct wall-clock instants
+		rec, won, err := l.TakeOver(context.Background(), lastTerm)
 		if err != nil || !won {
-			t.Fatalf("iter %d: TryAcquire won=%v err=%v", i, won, err)
+			t.Fatalf("iter %d: TakeOver won=%v err=%v", i, won, err)
 		}
 		if rec.Term <= lastTerm {
 			t.Errorf("term not monotonic: %d -> %d", lastTerm, rec.Term)
 		}
 		lastTerm = rec.Term
+	}
+}
+
+func TestLeaderWatchDetectsSupersession(t *testing.T) {
+	store := object.NewMem()
+	l1 := newLockShared(store, "node-1", "addr1")
+	l2 := newLockShared(store, "node-2", "addr2")
+
+	rec1, _, _ := l1.TryAcquire(context.Background(), 0)
+
+	// node-2 takes over.
+	rec2, won, _ := l2.TakeOver(context.Background(), rec1.Term)
+	if !won {
+		t.Fatal("node-2 should win TakeOver")
+	}
+
+	// node-1's watch reads the lock and should see a different term/nodeID.
+	current, err := l1.Read(context.Background())
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if current.Term == rec1.Term && current.NodeID == "node-1" {
+		t.Error("expected lock to reflect new leader, but still shows node-1")
+	}
+	if current.NodeID != "node-2" || current.Term != rec2.Term {
+		t.Errorf("expected node-2 term=%d, got %+v", rec2.Term, current)
 	}
 }

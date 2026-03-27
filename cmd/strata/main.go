@@ -41,11 +41,11 @@ func rootCmd() *cobra.Command {
 		checkpointIntervalMin int
 		logLevel              string
 		// multi-node
-		nodeID            string
-		peerListenAddr    string
-		advertisePeerAddr string
-		lockTTLSec        int
-		lockRenewSec      int
+		nodeID                 string
+		peerListenAddr         string
+		advertisePeerAddr      string
+		leaderWatchIntervalSec int
+		followerMaxRetries     int
 	)
 
 	cmd := &cobra.Command{
@@ -59,15 +59,15 @@ func rootCmd() *cobra.Command {
 			logrus.SetLevel(lvl)
 
 			cfg := strata.Config{
-				DataDir:            dataDir,
-				SegmentMaxSize:     segmentMaxSizeMB << 20,
-				SegmentMaxAge:      time.Duration(segmentMaxAgeSec) * time.Second,
-				CheckpointInterval: time.Duration(checkpointIntervalMin) * time.Minute,
-				NodeID:             nodeID,
-				PeerListenAddr:     peerListenAddr,
-				AdvertisePeerAddr:  advertisePeerAddr,
-				LockTTL:            time.Duration(lockTTLSec) * time.Second,
-				LockRenewInterval:  time.Duration(lockRenewSec) * time.Second,
+				DataDir:             dataDir,
+				SegmentMaxSize:      segmentMaxSizeMB << 20,
+				SegmentMaxAge:       time.Duration(segmentMaxAgeSec) * time.Second,
+				CheckpointInterval:  time.Duration(checkpointIntervalMin) * time.Minute,
+				NodeID:              nodeID,
+				PeerListenAddr:      peerListenAddr,
+				AdvertisePeerAddr:   advertisePeerAddr,
+				LeaderWatchInterval: time.Duration(leaderWatchIntervalSec) * time.Second,
+				FollowerMaxRetries:  followerMaxRetries,
 			}
 
 			if s3Bucket != "" {
@@ -128,8 +128,8 @@ func rootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&nodeID, "node-id", "", "stable unique node identifier (default: hostname)")
 	cmd.Flags().StringVar(&peerListenAddr, "peer-listen", "", "address for leader→follower WAL stream (e.g. 0.0.0.0:2380); enables multi-node mode")
 	cmd.Flags().StringVar(&advertisePeerAddr, "advertise-peer", "", "address followers use to reach this node's peer stream (default: --peer-listen)")
-	cmd.Flags().IntVar(&lockTTLSec, "lock-ttl-sec", 30, "leader lease TTL in seconds")
-	cmd.Flags().IntVar(&lockRenewSec, "lock-renew-sec", 10, "leader lease renewal interval in seconds")
+	cmd.Flags().IntVar(&leaderWatchIntervalSec, "leader-watch-interval-sec", 300, "how often (seconds) the leader reads the lock to detect supersession")
+	cmd.Flags().IntVar(&followerMaxRetries, "follower-max-retries", 5, "consecutive stream failures before a follower attempts a leader takeover")
 
 	return cmd
 }

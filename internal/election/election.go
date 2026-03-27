@@ -1,13 +1,14 @@
-// Package election implements S3-based leader election with a TTL lease.
+// Package election implements S3-based leader election.
 //
 // The protocol is optimistic:
 //  1. Read the current lock object.
-//  2. If absent or expired, write our record.
+//  2. If absent or owned by us, write our record.
 //  3. Wait briefly, then read back to verify nobody else won the race.
 //
-// This is safe for cases where the lock TTL is much larger than the S3 round-
-// trip time and clock drift between nodes is bounded. Nodes that lose the race
-// will read a different NodeID and back off.
+// There is no TTL on the lock. Liveness is detected via the WAL stream
+// (followers attempt a TakeOver after the stream becomes unreachable).
+// Leaders do an infrequent read-only watch to detect if they have been
+// superseded and step down gracefully.
 package election
 
 import (
@@ -25,97 +26,71 @@ const LockKey = "leader-lock"
 
 // LockRecord is the content of the leader-lock object.
 type LockRecord struct {
-	NodeID     string    `json:"node_id"`
-	Term       uint64    `json:"term"`
-	LeaderAddr string    `json:"leader_addr"` // follower peer-stream address
-	ExpiresAt  time.Time `json:"expires_at"`
+	NodeID     string `json:"node_id"`
+	Term       uint64 `json:"term"`
+	LeaderAddr string `json:"leader_addr"` // follower peer-stream address
 }
-
-// IsExpired reports whether the lease has passed its expiry.
-func (r *LockRecord) IsExpired() bool { return time.Now().After(r.ExpiresAt) }
 
 // Lock manages leader election via a single S3 object.
 type Lock struct {
 	store         object.Store
 	nodeID        string
 	advertiseAddr string
-	ttl           time.Duration
 }
 
 // NewLock creates a Lock.
-//   - advertiseAddr is the address followers use to reach this node's peer stream.
-//   - ttl is the lease duration; the leader must renew before it expires.
-func NewLock(store object.Store, nodeID, advertiseAddr string, ttl time.Duration) *Lock {
+// advertiseAddr is the address followers use to reach this node's peer stream.
+func NewLock(store object.Store, nodeID, advertiseAddr string) *Lock {
 	return &Lock{
 		store:         store,
 		nodeID:        nodeID,
 		advertiseAddr: advertiseAddr,
-		ttl:           ttl,
 	}
 }
 
-// TryAcquire attempts to acquire the leader lock.
+// TryAcquire attempts to acquire the leader lock at startup.
 //
-// floorTerm ensures the new term is always strictly greater than any previously
-// observed term, preventing term regression after a graceful shutdown.
+// It writes only if the lock is absent or already owned by this node.
+// If another node holds the lock, it returns (existing, false, nil) so the
+// caller can become a follower of that node.
 //
-// Returns:
-//   - (record, true, nil) if this node acquired the lock.
-//   - (existing, false, nil) if another healthy node holds it.
-//   - (nil, false, err) on storage error.
+// floorTerm ensures the new term is always strictly greater than any
+// previously observed term, preventing term regression after restart.
 func (l *Lock) TryAcquire(ctx context.Context, floorTerm uint64) (*LockRecord, bool, error) {
 	existing, err := l.Read(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 
-	// If another node holds a valid (unexpired) lease, we cannot acquire.
-	if existing != nil && existing.NodeID != l.nodeID && !existing.IsExpired() {
+	// Another node holds the lock — become a follower.
+	if existing != nil && existing.NodeID != l.nodeID {
 		return existing, false, nil
 	}
 
-	// Determine the new term: strictly greater than both floorTerm and any
-	// existing term to prevent term regression.
 	newTerm := floorTerm + 1
 	if existing != nil && existing.Term >= newTerm {
 		newTerm = existing.Term + 1
 	}
 
-	rec := &LockRecord{
-		NodeID:     l.nodeID,
-		Term:       newTerm,
-		LeaderAddr: l.advertiseAddr,
-		ExpiresAt:  time.Now().Add(l.ttl),
-	}
-	if err := l.write(ctx, rec); err != nil {
-		return nil, false, err
-	}
-
-	// Wait briefly then read back — this narrows (but does not eliminate) the
-	// race window with another concurrent candidate.
-	time.Sleep(100 * time.Millisecond)
-	verify, err := l.Read(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	if verify == nil || verify.NodeID != l.nodeID || verify.Term != newTerm {
-		return verify, false, nil // someone else won
-	}
-	return rec, true, nil
+	return l.writeAndVerify(ctx, newTerm)
 }
 
-// Renew extends the lease for an already-held lock. Returns an error if the
-// lock has been taken by another node (leader should step down).
-func (l *Lock) Renew(ctx context.Context, term uint64) error {
+// TakeOver forcefully attempts to acquire the lock, overwriting any existing
+// owner. Called by a follower after it has determined the leader is
+// unreachable. Uses the same optimistic read-back to resolve races between
+// concurrent candidates.
+func (l *Lock) TakeOver(ctx context.Context, floorTerm uint64) (*LockRecord, bool, error) {
 	existing, err := l.Read(ctx)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
-	if existing == nil || existing.NodeID != l.nodeID || existing.Term != term {
-		return fmt.Errorf("election: lock stolen (current: %+v)", existing)
+
+	newTerm := floorTerm + 1
+	if existing != nil && existing.Term >= newTerm {
+		newTerm = existing.Term + 1
 	}
-	existing.ExpiresAt = time.Now().Add(l.ttl)
-	return l.write(ctx, existing)
+
+	return l.writeAndVerify(ctx, newTerm)
 }
 
 // Release deletes the lock. Safe to call if the lock is not held.
@@ -138,6 +113,31 @@ func (l *Lock) Read(ctx context.Context) (*LockRecord, error) {
 		return nil, fmt.Errorf("election: decode lock: %w", err)
 	}
 	return &rec, nil
+}
+
+// writeAndVerify writes a new lock record for this node with the given term,
+// waits briefly, then reads back to confirm this node won.
+func (l *Lock) writeAndVerify(ctx context.Context, newTerm uint64) (*LockRecord, bool, error) {
+	rec := &LockRecord{
+		NodeID:     l.nodeID,
+		Term:       newTerm,
+		LeaderAddr: l.advertiseAddr,
+	}
+	if err := l.write(ctx, rec); err != nil {
+		return nil, false, err
+	}
+
+	// Wait briefly then read back — narrows (but does not eliminate) the
+	// race window with another concurrent candidate.
+	time.Sleep(100 * time.Millisecond)
+	verify, err := l.Read(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if verify == nil || verify.NodeID != l.nodeID || verify.Term != newTerm {
+		return verify, false, nil // someone else won
+	}
+	return rec, true, nil
 }
 
 func (l *Lock) write(ctx context.Context, rec *LockRecord) error {

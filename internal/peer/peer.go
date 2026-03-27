@@ -21,9 +21,19 @@ import (
 // leader's buffer window. The follower must re-bootstrap from S3.
 var ErrResyncRequired = status.Error(codes.FailedPrecondition, "resync_required")
 
+// ErrLeaderUnreachable is returned by Client.Follow after maxRetries
+// consecutive connection failures. The follower should attempt a TakeOver.
+var ErrLeaderUnreachable = status.Error(codes.Unavailable, "leader_unreachable")
+
 // IsResyncRequired reports whether err is an ErrResyncRequired signal.
 func IsResyncRequired(err error) bool {
 	return status.Code(err) == codes.FailedPrecondition
+}
+
+// IsLeaderUnreachable reports whether err is an ErrLeaderUnreachable signal.
+func IsLeaderUnreachable(err error) bool {
+	s, ok := status.FromError(err)
+	return ok && s.Code() == codes.Unavailable && s.Message() == "leader_unreachable"
 }
 
 // ── JSON codec ────────────────────────────────────────────────────────────────

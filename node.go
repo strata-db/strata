@@ -29,7 +29,7 @@ var (
 )
 
 // nodeRole identifies whether the node is leader, follower, or single-node.
-type nodeRole int
+type nodeRole int32
 
 const (
 	roleSingle   nodeRole = iota // ObjectStore nil or PeerListenAddr empty
@@ -47,33 +47,37 @@ const (
 // Leader mode:
 //
 //	Same as single-node, plus fan-out to followers via peer gRPC stream.
-//	Holds the S3 leader lock and renews it periodically.
+//	Holds the S3 leader lock; watches it infrequently for supersession.
 //
 // Follower mode:
 //
 //	Reads only — writes return ErrNotLeader.
 //	Receives WAL stream from leader, writes entries to local WAL and store.
+//	After persistent stream failure, attempts a TakeOver election.
 type Node struct {
 	cfg  Config
 	term uint64
-	role nodeRole
+	role atomic.Int32 // stores nodeRole values; use loadRole/storeRole
 
 	db  *istore.Store
 	wal *wal.WAL // non-nil on leader/single; non-nil on follower (local WAL, no uploader)
 
-	// mu serialises all leader writes for CAS safety.
+	// mu serialises all leader writes for CAS safety, and role transitions.
 	mu sync.Mutex
 
 	// leader-only
 	peerSrv *peer.Server
 	peerLis net.Listener
 
-	// follower-only
+	// follower-only; owned exclusively by followLoop after startup.
 	peerCli *peer.Client
 
 	entriesSinceCheckpoint int64
 	cancelBg               context.CancelFunc
 }
+
+func (n *Node) loadRole() nodeRole   { return nodeRole(n.role.Load()) }
+func (n *Node) storeRole(r nodeRole) { n.role.Store(int32(r)) }
 
 // Open creates and starts a Node.
 func Open(cfg Config) (*Node, error) {
@@ -168,7 +172,7 @@ func Open(cfg Config) (*Node, error) {
 
 	// ── Determine role ───────────────────────────────────────────────────────
 	if cfg.PeerListenAddr == "" || cfg.ObjectStore == nil {
-		n.role = roleSingle
+		n.storeRole(roleSingle)
 	} else {
 		if err := n.electAndStart(bgCtx); err != nil {
 			bgCancel()
@@ -179,10 +183,10 @@ func Open(cfg Config) (*Node, error) {
 	}
 
 	// ── Background jobs ──────────────────────────────────────────────────────
-	if n.role != roleFollower && cfg.ObjectStore != nil && cfg.CheckpointInterval > 0 {
+	if n.loadRole() != roleFollower && cfg.ObjectStore != nil && cfg.CheckpointInterval > 0 {
 		go n.checkpointLoop(bgCtx)
 	}
-	if n.role == roleFollower {
+	if n.loadRole() == roleFollower {
 		go n.followLoop(bgCtx)
 	}
 
@@ -191,7 +195,7 @@ func Open(cfg Config) (*Node, error) {
 
 // electAndStart runs leader election and configures the node as leader or follower.
 func (n *Node) electAndStart(bgCtx context.Context) error {
-	lock := election.NewLock(n.cfg.ObjectStore, n.cfg.NodeID, n.cfg.AdvertisePeerAddr, n.cfg.LockTTL)
+	lock := election.NewLock(n.cfg.ObjectStore, n.cfg.NodeID, n.cfg.AdvertisePeerAddr)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -202,60 +206,81 @@ func (n *Node) electAndStart(bgCtx context.Context) error {
 	}
 
 	if won {
-		n.role = roleLeader
-		n.term = rec.Term
-		// Re-open WAL with the S3 uploader now that we know we're the leader.
-		n.wal.Close()
-		walDir := filepath.Join(n.cfg.DataDir, "wal")
-		w2, err := wal.Open(walDir, n.term, n.db.CurrentRevision()+1,
-			wal.WithUploader(makeUploader(n.cfg.ObjectStore)),
-			wal.WithSegmentMaxSize(n.cfg.SegmentMaxSize),
-			wal.WithSegmentMaxAge(n.cfg.SegmentMaxAge),
-		)
-		if err != nil {
-			return fmt.Errorf("strata: reopen WAL as leader: %w", err)
+		if err := n.becomeLeader(bgCtx, lock, rec); err != nil {
+			return err
 		}
-		n.wal = w2
-		w2.Start(bgCtx)
-
-		// Start peer gRPC server for followers.
-		n.peerSrv = peer.NewServer(n.cfg.PeerBufferSize)
-		lis, err := net.Listen("tcp", n.cfg.PeerListenAddr)
-		if err != nil {
-			return fmt.Errorf("strata: peer listen %s: %w", n.cfg.PeerListenAddr, err)
-		}
-		n.peerLis = lis
-		srv := grpc.NewServer(grpc.ForceServerCodec(peer.Codec{}))
-		peer.RegisterWalStreamServer(srv, n.peerSrv)
-		go func() {
-			if err := srv.Serve(lis); err != nil {
-				logrus.Warnf("strata: peer server: %v", err)
-			}
-		}()
-		logrus.Infof("strata: elected leader (term=%d, peer=%s)", n.term, n.cfg.PeerListenAddr)
-
-		// Renew lease in background.
-		go n.renewLoop(bgCtx, lock, n.term)
 	} else {
-		n.role = roleFollower
-		n.peerCli = peer.NewClient(rec.LeaderAddr, n.cfg.NodeID)
+		n.storeRole(roleFollower)
+		n.peerCli = peer.NewClient(rec.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries)
 		logrus.Infof("strata: following leader at %s (term=%d)", rec.LeaderAddr, rec.Term)
 	}
 	return nil
 }
 
-// renewLoop renews the leader lease on a ticker. Steps down if renewal fails.
-func (n *Node) renewLoop(ctx context.Context, lock *election.Lock, term uint64) {
-	ticker := time.NewTicker(n.cfg.LockRenewInterval)
+// becomeLeader transitions this node to leader role.
+// It re-opens the WAL with an S3 uploader, starts the peer gRPC server,
+// and launches the watchLoop. Must be called with n.mu not held.
+func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *election.LockRecord) error {
+	// Re-open WAL with the S3 uploader now that we know we're the leader.
+	n.wal.Close()
+	walDir := filepath.Join(n.cfg.DataDir, "wal")
+	w2, err := wal.Open(walDir, rec.Term, n.db.CurrentRevision()+1,
+		wal.WithUploader(makeUploader(n.cfg.ObjectStore)),
+		wal.WithSegmentMaxSize(n.cfg.SegmentMaxSize),
+		wal.WithSegmentMaxAge(n.cfg.SegmentMaxAge),
+	)
+	if err != nil {
+		return fmt.Errorf("strata: open WAL as leader: %w", err)
+	}
+	w2.Start(bgCtx)
+
+	// Start peer gRPC server for followers.
+	peerSrv := peer.NewServer(n.cfg.PeerBufferSize)
+	lis, err := net.Listen("tcp", n.cfg.PeerListenAddr)
+	if err != nil {
+		w2.Close()
+		return fmt.Errorf("strata: peer listen %s: %w", n.cfg.PeerListenAddr, err)
+	}
+	srv := grpc.NewServer(grpc.ForceServerCodec(peer.Codec{}))
+	peer.RegisterWalStreamServer(srv, peerSrv)
+	go func() {
+		if err := srv.Serve(lis); err != nil {
+			logrus.Warnf("strata: peer server: %v", err)
+		}
+	}()
+
+	n.mu.Lock()
+	n.wal = w2
+	n.term = rec.Term
+	n.peerSrv = peerSrv
+	n.peerLis = lis
+	n.storeRole(roleLeader)
+	n.mu.Unlock()
+
+	logrus.Infof("strata: elected leader (term=%d, peer=%s)", rec.Term, n.cfg.PeerListenAddr)
+	go n.watchLoop(bgCtx, lock, rec.Term)
+	return nil
+}
+
+// watchLoop periodically reads the lock from S3 to detect if this node has
+// been superseded by a new election. It is read-only — no writes or renewals.
+// Steps down (cancelBg) if the lock's term or owner changes.
+// On clean shutdown, releases the lock so a successor can acquire it immediately.
+func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) {
+	ticker := time.NewTicker(n.cfg.LeaderWatchInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			rCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			err := lock.Renew(rCtx, term)
+			rec, err := lock.Read(rCtx)
 			cancel()
 			if err != nil {
-				logrus.Errorf("strata: lease renewal failed — stepping down: %v", err)
+				logrus.Warnf("strata: leader watch: read lock: %v", err)
+				continue // transient S3 error; keep going
+			}
+			if rec == nil || rec.Term != term || rec.NodeID != n.cfg.NodeID {
+				logrus.Errorf("strata: leader watch: lock superseded (current: %+v) — stepping down", rec)
 				n.cancelBg()
 				return
 			}
@@ -269,22 +294,89 @@ func (n *Node) renewLoop(ctx context.Context, lock *election.Lock, term uint64) 
 }
 
 // followLoop receives WAL entries from the leader and applies them locally.
-func (n *Node) followLoop(ctx context.Context) {
+// On ErrLeaderUnreachable it attempts a TakeOver election. If it wins it
+// transitions to leader in-process; if it loses it updates its client to
+// follow the new leader.
+func (n *Node) followLoop(bgCtx context.Context) {
+	lock := election.NewLock(n.cfg.ObjectStore, n.cfg.NodeID, n.cfg.AdvertisePeerAddr)
+	cli := n.peerCli
 	fromRev := n.db.CurrentRevision() + 1
-	err := n.peerCli.Follow(ctx, fromRev, func(e wal.Entry) error {
-		// Write to local WAL for crash-recovery, then apply to Pebble.
-		if err := n.wal.Append(&e); err != nil {
-			return err
+
+	for {
+		err := cli.Follow(bgCtx, fromRev, func(e wal.Entry) error {
+			if err := n.wal.Append(&e); err != nil {
+				return err
+			}
+			fromRev = e.Revision + 1
+			return n.db.Apply([]wal.Entry{e})
+		})
+
+		if bgCtx.Err() != nil {
+			return
 		}
-		return n.db.Apply([]wal.Entry{e})
-	})
-	if err != nil && ctx.Err() == nil {
+
 		if peer.IsResyncRequired(err) {
 			logrus.Error("strata: follower resync required — restart the node to re-bootstrap from S3")
-		} else {
-			logrus.Errorf("strata: follow loop exited: %v", err)
+			n.cancelBg()
+			return
+		}
+
+		if peer.IsLeaderUnreachable(err) {
+			logrus.Warn("strata: leader unreachable — attempting election takeover")
+			newCli, promoted := n.attemptPromotion(bgCtx, lock)
+			if promoted {
+				return // this goroutine's work is done; node is now leader
+			}
+			if newCli != nil {
+				cli = newCli
+				logrus.Infof("strata: following new leader")
+			}
+			continue
+		}
+
+		logrus.Warnf("strata: follow loop error (will retry): %v", err)
+		select {
+		case <-time.After(2 * time.Second):
+		case <-bgCtx.Done():
+			return
 		}
 	}
+}
+
+// attemptPromotion tries to take over the leader lock after detecting the
+// current leader is unreachable.
+//
+// Returns (nil, true) if this node won and is now leader.
+// Returns (newClient, false) if another node won; newClient follows that node.
+// Returns (nil, false) on S3 errors; caller should retry.
+func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock) (*peer.Client, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rec, won, err := lock.TakeOver(ctx, n.term)
+	if err != nil {
+		logrus.Errorf("strata: takeover election error: %v", err)
+		return nil, false
+	}
+
+	if won {
+		if err := n.becomeLeader(bgCtx, lock, rec); err != nil {
+			logrus.Errorf("strata: promotion failed: %v", err)
+			return nil, false
+		}
+		// Start checkpoint loop now that we're leader.
+		if n.cfg.ObjectStore != nil && n.cfg.CheckpointInterval > 0 {
+			go n.checkpointLoop(bgCtx)
+		}
+		return nil, true
+	}
+
+	// Another node won — follow it.
+	if rec != nil && rec.LeaderAddr != "" {
+		logrus.Infof("strata: lost election to %s (term=%d) — following", rec.NodeID, rec.Term)
+		return peer.NewClient(rec.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries), false
+	}
+	return nil, false
 }
 
 // Close shuts down the node cleanly.
@@ -302,7 +394,7 @@ func (n *Node) Close() error {
 // ── Write path (leader / single-node only) ────────────────────────────────────
 
 func (n *Node) requireLeader() error {
-	if n.role == roleFollower {
+	if n.loadRole() == roleFollower {
 		return ErrNotLeader
 	}
 	return nil
@@ -475,7 +567,7 @@ func (n *Node) Count(prefix string) (int64, error) { return n.db.Count(prefix) }
 func (n *Node) CurrentRevision() int64             { return n.db.CurrentRevision() }
 func (n *Node) CompactRevision() int64             { return n.db.CompactRevision() }
 func (n *Node) Config() Config                     { return n.cfg }
-func (n *Node) IsLeader() bool                     { return n.role != roleFollower }
+func (n *Node) IsLeader() bool                     { return n.loadRole() != roleFollower }
 
 func (n *Node) WaitForRevision(ctx context.Context, rev int64) error {
 	return n.db.WaitForRevision(ctx, rev)

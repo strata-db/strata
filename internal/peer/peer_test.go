@@ -41,7 +41,7 @@ func TestStreamDelivery(t *testing.T) {
 	srv := peer.NewServer(1000)
 	addr := startServer(t, srv)
 
-	cli := peer.NewClient(addr, "follower-1")
+	cli := peer.NewClient(addr, "follower-1", 0)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
@@ -84,7 +84,7 @@ func TestCatchUp(t *testing.T) {
 		srv.Broadcast(makeEntry(i))
 	}
 
-	cli := peer.NewClient(addr, "follower-late")
+	cli := peer.NewClient(addr, "follower-late", 0)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
@@ -131,7 +131,7 @@ func TestResyncRequired(t *testing.T) {
 	}
 
 	addr := startServer(t, srv)
-	cli := peer.NewClient(addr, "follower-stale")
+	cli := peer.NewClient(addr, "follower-stale", 0)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
@@ -152,6 +152,21 @@ func TestResyncRequired(t *testing.T) {
 	}
 }
 
+// TestLeaderUnreachable verifies that Follow returns ErrLeaderUnreachable
+// after maxRetries consecutive connection failures.
+func TestLeaderUnreachable(t *testing.T) {
+	// Point at a port where nothing is listening.
+	cli := peer.NewClient("127.0.0.1:19999", "follower-unreachable", 3)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+
+	err := cli.Follow(ctx, 1, func(e wal.Entry) error { return nil })
+	if !peer.IsLeaderUnreachable(err) {
+		t.Errorf("expected IsLeaderUnreachable, got: %v", err)
+	}
+}
+
 // TestMultipleFollowers verifies fan-out to multiple concurrent followers.
 func TestMultipleFollowers(t *testing.T) {
 	srv := peer.NewServer(1000)
@@ -166,7 +181,7 @@ func TestMultipleFollowers(t *testing.T) {
 		received[i] = make(chan wal.Entry, 16)
 		id := fmt.Sprintf("follower-%d", i)
 		ch := received[i]
-		cli := peer.NewClient(addr, id)
+		cli := peer.NewClient(addr, id, 0)
 		go cli.Follow(ctx, 1, func(e wal.Entry) error {
 			ch <- e
 			return nil
@@ -203,7 +218,7 @@ func TestNoDuplicatesOnCatchUp(t *testing.T) {
 	}
 
 	addr := startServer(t, srv)
-	cli := peer.NewClient(addr, "follower-dedup")
+	cli := peer.NewClient(addr, "follower-dedup", 0)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()

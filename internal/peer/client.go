@@ -15,31 +15,51 @@ import (
 type Client struct {
 	leaderAddr string
 	nodeID     string
+	maxRetries int // consecutive failures before returning ErrLeaderUnreachable (0 = unlimited)
 }
 
 // NewClient creates a Client that will connect to leaderAddr.
-func NewClient(leaderAddr, nodeID string) *Client {
-	return &Client{leaderAddr: leaderAddr, nodeID: nodeID}
+// maxRetries is the number of consecutive connection failures before Follow
+// returns ErrLeaderUnreachable so the caller can attempt a leader election.
+// Use 0 for unlimited retries (single-node / testing).
+func NewClient(leaderAddr, nodeID string, maxRetries int) *Client {
+	return &Client{leaderAddr: leaderAddr, nodeID: nodeID, maxRetries: maxRetries}
 }
 
 // Follow streams WAL entries from the leader starting at fromRev, calling
 // applyFn for each entry. fromRev advances automatically as entries are applied.
 //
-// Follow reconnects on transient errors and returns only when ctx is cancelled
-// or a terminal error (resync required) is received.
+// Follow reconnects on transient errors. It returns:
+//   - ctx.Err() on context cancellation.
+//   - ErrResyncRequired when the leader's buffer no longer covers fromRev.
+//   - ErrLeaderUnreachable after maxRetries consecutive connection failures.
 func (c *Client) Follow(ctx context.Context, fromRev int64, applyFn func(wal.Entry) error) error {
+	consecutiveFailures := 0
 	for {
 		nextRev, err := c.followOnce(ctx, fromRev, applyFn)
-		fromRev = nextRev
 
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if IsResyncRequired(err) {
 			logrus.Errorf("peer: leader requires resync from rev=%d: %v", fromRev, err)
-			return err // caller must re-bootstrap from S3
+			return err
 		}
-		logrus.Warnf("peer: stream error (will retry): %v", err)
+
+		// Progress resets the failure counter.
+		if nextRev > fromRev {
+			consecutiveFailures = 0
+		} else {
+			consecutiveFailures++
+		}
+		fromRev = nextRev
+
+		if c.maxRetries > 0 && consecutiveFailures >= c.maxRetries {
+			logrus.Errorf("peer: leader unreachable after %d attempts", consecutiveFailures)
+			return ErrLeaderUnreachable
+		}
+
+		logrus.Warnf("peer: stream error (attempt %d): %v", consecutiveFailures, err)
 		select {
 		case <-time.After(2 * time.Second):
 		case <-ctx.Done():

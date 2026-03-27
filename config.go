@@ -52,14 +52,16 @@ type Config struct {
 	// server. Defaults to PeerListenAddr.
 	AdvertisePeerAddr string
 
-	// LockTTL is the leader lease duration. The leader must renew before it
-	// expires or followers will elect a new leader.
-	// Default: 30 s.
-	LockTTL time.Duration
+	// LeaderWatchInterval is how often the leader reads the lock from S3 to
+	// detect if it has been superseded by a new election. This is the only
+	// periodic S3 operation the leader performs after winning; it does not
+	// write or renew. Default: 5 minutes.
+	LeaderWatchInterval time.Duration
 
-	// LockRenewInterval is how often the leader renews its lease.
-	// Must be well below LockTTL. Default: 10 s.
-	LockRenewInterval time.Duration
+	// FollowerMaxRetries is the number of consecutive stream-reconnect failures
+	// a follower tolerates before concluding the leader is dead and attempting
+	// a TakeOver election. Default: 5.
+	FollowerMaxRetries int
 
 	// PeerBufferSize is the number of WAL entries the leader buffers for
 	// follower catch-up. Default: 10 000.
@@ -86,11 +88,11 @@ func (c *Config) setDefaults() {
 	if c.AdvertisePeerAddr == "" {
 		c.AdvertisePeerAddr = c.PeerListenAddr
 	}
-	if c.LockTTL == 0 {
-		c.LockTTL = 30 * time.Second
+	if c.LeaderWatchInterval == 0 {
+		c.LeaderWatchInterval = 5 * time.Minute
 	}
-	if c.LockRenewInterval == 0 {
-		c.LockRenewInterval = 10 * time.Second
+	if c.FollowerMaxRetries == 0 {
+		c.FollowerMaxRetries = 5
 	}
 	if c.PeerBufferSize == 0 {
 		c.PeerBufferSize = 10_000
