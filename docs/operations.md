@@ -7,7 +7,7 @@ The simplest durable deployment. A single node writes WAL segments and checkpoin
 ```bash
 strata \
   --data-dir  /var/lib/strata \
-  --listen    0.0.0.0:2379  \
+  --listen    0.0.0.0:3379  \
   --s3-bucket my-bucket     \
   --s3-prefix strata/
 ```
@@ -19,7 +19,7 @@ AWS credentials are resolved from the standard chain: `AWS_*` environment variab
 ```bash
 strata \
   --data-dir    /var/lib/strata \
-  --listen      0.0.0.0:2379   \
+  --listen      0.0.0.0:3379   \
   --s3-bucket   my-bucket      \
   --s3-prefix   strata/        \
   --s3-endpoint http://minio:9000
@@ -42,22 +42,22 @@ All nodes run the same command. At startup they race to acquire the S3 leader lo
 # Node A
 strata \
   --data-dir       /var/lib/strata     \
-  --listen         0.0.0.0:2379        \
+  --listen         0.0.0.0:3379        \
   --s3-bucket      my-bucket           \
   --s3-prefix      strata/             \
   --node-id        node-a              \
-  --peer-listen    0.0.0.0:2380        \
-  --advertise-peer node-a.internal:2380
+  --peer-listen    0.0.0.0:3380        \
+  --advertise-peer node-a.internal:3380
 
 # Node B
 strata \
   --data-dir       /var/lib/strata     \
-  --listen         0.0.0.0:2379        \
+  --listen         0.0.0.0:3379        \
   --s3-bucket      my-bucket           \
   --s3-prefix      strata/             \
   --node-id        node-b              \
-  --peer-listen    0.0.0.0:2380        \
-  --advertise-peer node-b.internal:2380
+  --peer-listen    0.0.0.0:3380        \
+  --advertise-peer node-b.internal:3380
 
 # Node C — same as B, different --node-id and --advertise-peer
 ```
@@ -65,7 +65,7 @@ strata \
 ### Leader election and failover
 
 - On startup each node writes its address to the S3 lock **only if the lock is absent**. The first writer wins and becomes the leader.
-- The leader streams WAL entries to all followers over the peer port (default 2380). Followers apply entries and serve local reads.
+- The leader streams WAL entries to all followers over the peer port (default 3380). Followers apply entries and serve local reads.
 - A follower that observes `--follower-max-retries` consecutive stream failures (default 5 × ~2 s = ~10 s) overwrites the S3 lock with its own address and becomes the new leader.
 - The former leader periodically re-reads the S3 lock (`--leader-watch-interval-sec`, default 300 s). When it detects the lock no longer points to itself, it steps down.
 - Writes sent to a follower are automatically forwarded to the current leader and the result is returned to the caller.

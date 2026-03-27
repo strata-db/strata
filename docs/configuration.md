@@ -10,7 +10,7 @@
 | `SegmentMaxAge` | `time.Duration` | 10 s | WAL segment rotation age threshold. |
 | `CheckpointInterval` | `time.Duration` | 15 min | How often the leader writes a full snapshot to S3. Set to 0 to disable. |
 | `NodeID` | `string` | hostname | Stable unique identifier for this node. Must not change across restarts. |
-| `PeerListenAddr` | `string` | `""` | gRPC listen address for the WAL stream (e.g. `0.0.0.0:2380`). Empty = single-node mode. |
+| `PeerListenAddr` | `string` | `""` | gRPC listen address for the WAL stream (e.g. `0.0.0.0:3380`). Empty = single-node mode. |
 | `AdvertisePeerAddr` | `string` | `PeerListenAddr` | Address that followers use to reach this node. Set this when the listen address is not directly routable (container, NAT). |
 | `LeaderWatchInterval` | `time.Duration` | 5 min | How often the leader re-reads the S3 lock to detect supersession by a new leader. |
 | `FollowerMaxRetries` | `int` | 5 | Consecutive stream failures before a follower attempts election takeover. |
@@ -41,7 +41,7 @@ type Store interface {
 | Flag | Default | Description |
 |---|---|---|
 | `--data-dir` | `/var/lib/strata` | Pebble + WAL storage directory |
-| `--listen` | `0.0.0.0:2379` | etcd v3 gRPC listen address |
+| `--listen` | `0.0.0.0:3379` | etcd v3 gRPC listen address |
 | `--s3-bucket` | — | S3 bucket name |
 | `--s3-prefix` | — | Key prefix inside the bucket (no trailing slash needed) |
 | `--s3-endpoint` | — | Custom S3 endpoint URL (MinIO, Ceph, etc.) |

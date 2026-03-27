@@ -3,12 +3,15 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/makhov/strata/internal/wal"
+	
 )
 
 // Store is the Pebble-backed state machine.
@@ -27,22 +30,41 @@ type Store struct {
 	notify chan struct{} // closed and replaced on each revision advance
 }
 
+// lockRetryTimeout is how long Open retries when another process holds the
+// pebble LOCK file. This covers the window where a previous pod is still
+// terminating when the replacement starts.
+const lockRetryTimeout = 30 * time.Second
+
 // Open opens (or creates) the Pebble database at dir and returns a Store.
 // The caller should call Recover to replay WAL entries before serving requests.
+//
+// If the database is locked by another process, Open retries for up to
+// lockRetryTimeout before returning an error. This handles the Kubernetes pod
+// replacement race where the old instance has not yet released the lock.
 func Open(dir string) (*Store, error) {
-	db, err := pebble.Open(dir, &pebble.Options{})
-	if err != nil {
-		return nil, fmt.Errorf("store: open pebble %q: %w", dir, err)
+	deadline := time.Now().Add(lockRetryTimeout)
+	for {
+		db, err := pebble.Open(dir, &pebble.Options{})
+		if err == nil {
+			s := &Store{db: db, notify: make(chan struct{})}
+			if err := s.loadMeta(); err != nil {
+				db.Close()
+				return nil, err
+			}
+			return s, nil
+		}
+		if !isPebbleLockError(err) || time.Now().After(deadline) {
+			return nil, fmt.Errorf("store: open pebble %q: %w", dir, err)
+		}
+		logrus.Warnf("strata: pebble locked at %q, retrying in 1s (previous instance still terminating?)", dir)
+		time.Sleep(time.Second)
 	}
-	s := &Store{
-		db:     db,
-		notify: make(chan struct{}),
-	}
-	if err := s.loadMeta(); err != nil {
-		db.Close()
-		return nil, err
-	}
-	return s, nil
+}
+
+// isPebbleLockError reports whether err is a lock-file contention error.
+// Pebble names its lock file "LOCK", so the path always appears in the message.
+func isPebbleLockError(err error) bool {
+	return strings.Contains(err.Error(), "LOCK")
 }
 
 // OpenMem opens an in-memory Pebble store (for testing / followers).

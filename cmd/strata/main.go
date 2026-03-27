@@ -130,7 +130,7 @@ func rootCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&dataDir, "data-dir", "/var/lib/strata", "directory for Pebble data and local WAL segments")
-	cmd.Flags().StringVar(&listenAddr, "listen", "0.0.0.0:2379", "gRPC listen address (kine/etcd protocol)")
+	cmd.Flags().StringVar(&listenAddr, "listen", "0.0.0.0:3379", "gRPC listen address (kine/etcd protocol)")
 	cmd.Flags().StringVar(&s3Bucket, "s3-bucket", "", "S3 bucket for WAL archive and checkpoints (optional)")
 	cmd.Flags().StringVar(&s3Prefix, "s3-prefix", "", "key prefix inside the S3 bucket")
 	cmd.Flags().StringVar(&s3Endpoint, "s3-endpoint", "", "custom S3 endpoint URL (for MinIO or other S3-compatible stores)")
@@ -140,7 +140,7 @@ func rootCmd() *cobra.Command {
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (trace/debug/info/warn/error)")
 	// multi-node
 	cmd.Flags().StringVar(&nodeID, "node-id", "", "stable unique node identifier (default: hostname)")
-	cmd.Flags().StringVar(&peerListenAddr, "peer-listen", "", "address for leader→follower WAL stream (e.g. 0.0.0.0:2380); enables multi-node mode")
+	cmd.Flags().StringVar(&peerListenAddr, "peer-listen", "", "address for leader→follower WAL stream (e.g. 0.0.0.0:3380); enables multi-node mode")
 	cmd.Flags().StringVar(&advertisePeerAddr, "advertise-peer", "", "address followers use to reach this node's peer stream (default: --peer-listen)")
 	cmd.Flags().IntVar(&leaderWatchIntervalSec, "leader-watch-interval-sec", 300, "how often (seconds) the leader reads the lock to detect supersession")
 	cmd.Flags().IntVar(&followerMaxRetries, "follower-max-retries", 5, "consecutive stream failures before a follower attempts a leader takeover")

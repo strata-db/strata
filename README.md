@@ -63,15 +63,15 @@ The `strata` binary exposes the etcd v3 gRPC protocol. Use `etcdctl`, the offici
 go install github.com/makhov/strata/cmd/strata@latest
 
 # Single node, local only
-strata --data-dir /var/lib/strata --listen 0.0.0.0:2379
+strata --data-dir /var/lib/strata --listen 0.0.0.0:3379
 
 # Single node with S3
-strata --data-dir /var/lib/strata --listen 0.0.0.0:2379 \
+strata --data-dir /var/lib/strata --listen 0.0.0.0:3379 \
        --s3-bucket my-bucket --s3-prefix strata/
 
 # Verify
-etcdctl --endpoints=localhost:2379 put /hello world
-etcdctl --endpoints=localhost:2379 get /hello
+etcdctl --endpoints=localhost:3379 put /hello world
+etcdctl --endpoints=localhost:3379 get /hello
 ```
 
 Multi-node and production setup: see [docs/operations.md](docs/operations.md).

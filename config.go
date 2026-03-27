@@ -52,7 +52,7 @@ type Config struct {
 	NodeID string
 
 	// PeerListenAddr is the address on which the peer WAL-streaming gRPC
-	// server listens (e.g. "0.0.0.0:2380"). Empty → single-node mode.
+	// server listens (e.g. "0.0.0.0:3380"). Empty → single-node mode.
 	PeerListenAddr string
 
 	// AdvertisePeerAddr is the address followers use to reach this node's peer

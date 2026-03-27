@@ -3,8 +3,8 @@
 //
 // To avoid a protoc dependency the service descriptor is written by hand and
 // messages are encoded with a JSON codec forced on both the peer server and
-// client via grpc.ForceCodec.  The kine gRPC server (port 2379) keeps the
-// default proto codec; only the peer server (port 2380) uses JSON.
+// client via grpc.ForceCodec.  The kine gRPC server (port 3379) keeps the
+// default proto codec; only the peer server (port 3380) uses JSON.
 package peer
 
 import (
