@@ -11,7 +11,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/makhov/strata/internal/wal"
-	
+	"github.com/sirupsen/logrus"
 )
 
 // Store is the Pebble-backed state machine.
