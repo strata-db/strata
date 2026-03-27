@@ -120,7 +120,7 @@ func (w *WAL) Append(e *Entry) error {
 	return nil
 }
 
-// rotateLocked seals the active segment and opens a new one.
+// rotateLocked seals the active segment and opens a fresh one.
 // Must be called with w.mu held.
 func (w *WAL) rotateLocked() {
 	if w.active == nil {
@@ -128,6 +128,7 @@ func (w *WAL) rotateLocked() {
 	}
 	seg := w.active
 	w.active = nil
+	nextRev := seg.FirstRev() + int64(seg.EntryCount())
 	if err := seg.Seal(); err != nil {
 		logrus.Errorf("wal: seal segment %q: %v", seg.Path(), err)
 		return
@@ -141,6 +142,12 @@ func (w *WAL) rotateLocked() {
 		}
 	}
 	logrus.Debugf("wal: sealed segment %q (%d entries, %d bytes)", seg.Path(), seg.EntryCount(), seg.Size())
+	sw, err := OpenSegmentWriter(w.dir, w.term, nextRev)
+	if err != nil {
+		logrus.Errorf("wal: open new segment after rotation: %v", err)
+		return
+	}
+	w.active = sw
 }
 
 // rotationLoop periodically rotates the active segment based on age.

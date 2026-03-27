@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -11,46 +12,70 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
 
 	"github.com/makhov/strata/internal/checkpoint"
+	"github.com/makhov/strata/internal/election"
 	"github.com/makhov/strata/internal/object"
+	"github.com/makhov/strata/internal/peer"
 	istore "github.com/makhov/strata/internal/store"
 	"github.com/makhov/strata/internal/wal"
 )
 
-// Node is the top-level single-node Strata instance.
-//
-// Write path:  Put/Delete → WAL.Append (fsync) → store.Apply → notify watchers
-// Background:  WAL segments uploaded to S3 when sealed (size or age threshold)
-//
-//	Periodic checkpoints written to S3
-//
-// ErrKeyExists is returned by Create when the key already exists.
-var ErrKeyExists = errors.New("strata: key already exists")
+// Sentinel errors.
+var (
+	ErrKeyExists = errors.New("strata: key already exists")
+	ErrNotLeader = errors.New("strata: this node is not the leader; writes are rejected")
+)
 
+// nodeRole identifies whether the node is leader, follower, or single-node.
+type nodeRole int
+
+const (
+	roleSingle   nodeRole = iota // ObjectStore nil or PeerListenAddr empty
+	roleLeader                   // elected leader
+	roleFollower                 // following a remote leader
+)
+
+// Node is the top-level Strata instance.
+//
+// Single-node mode (PeerListenAddr == ""):
+//
+//	Writes: WAL.Append (fsync) → store.Apply → notify watchers
+//	Background: WAL segments uploaded to S3, periodic checkpoints
+//
+// Leader mode:
+//
+//	Same as single-node, plus fan-out to followers via peer gRPC stream.
+//	Holds the S3 leader lock and renews it periodically.
+//
+// Follower mode:
+//
+//	Reads only — writes return ErrNotLeader.
+//	Receives WAL stream from leader, writes entries to local WAL and store.
 type Node struct {
 	cfg  Config
-	term uint64 // current term, read-only after Open
+	term uint64
+	role nodeRole
 
 	db  *istore.Store
-	wal *wal.WAL
+	wal *wal.WAL // non-nil on leader/single; non-nil on follower (local WAL, no uploader)
 
-	// mu serialises all writes so CAS operations are safe on single node.
+	// mu serialises all leader writes for CAS safety.
 	mu sync.Mutex
 
-	// entriesSinceCheckpoint is incremented on every Apply; reset on checkpoint.
-	entriesSinceCheckpoint int64
+	// leader-only
+	peerSrv *peer.Server
+	peerLis net.Listener
 
-	cancelBg context.CancelFunc
+	// follower-only
+	peerCli *peer.Client
+
+	entriesSinceCheckpoint int64
+	cancelBg               context.CancelFunc
 }
 
-// Open starts a Node using the given Config.
-//
-// On startup it:
-//  1. Downloads the latest checkpoint from object storage (if any)
-//  2. Opens (or creates) Pebble in DataDir
-//  3. Replays any WAL segments that postdate the checkpoint
-//  4. Starts background WAL rotation and upload goroutines
+// Open creates and starts a Node.
 func Open(cfg Config) (*Node, error) {
 	cfg.setDefaults()
 
@@ -62,45 +87,45 @@ func Open(cfg Config) (*Node, error) {
 		term     uint64 = 1
 	)
 
-	// ── Step 1: restore checkpoint from object storage ───────────────────────
+	// ── Restore checkpoint ───────────────────────────────────────────────────
 	if cfg.ObjectStore != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-
 		manifest, err := checkpoint.ReadManifest(ctx, cfg.ObjectStore)
 		if err != nil {
 			return nil, fmt.Errorf("strata: read manifest: %w", err)
 		}
 		if manifest != nil {
-			logrus.Infof("strata: restoring checkpoint %q (rev=%d)", manifest.CheckpointKey, manifest.Revision)
+			logrus.Infof("strata: manifest found (rev=%d)", manifest.Revision)
 			if _, err := os.Stat(pebbleDir); errors.Is(err, os.ErrNotExist) {
 				t, rev, err := checkpoint.Restore(ctx, cfg.ObjectStore, manifest.CheckpointKey, pebbleDir)
 				if err != nil {
 					return nil, fmt.Errorf("strata: restore checkpoint: %w", err)
 				}
-				term = t
-				startRev = rev
+				term, startRev = t, rev
 				logrus.Infof("strata: checkpoint restored (term=%d rev=%d)", term, startRev)
 			}
 		}
 	}
 
-	// ── Step 2: open Pebble ──────────────────────────────────────────────────
+	// ── Open Pebble ──────────────────────────────────────────────────────────
 	db, err := istore.Open(pebbleDir)
 	if err != nil {
 		return nil, fmt.Errorf("strata: open store: %w", err)
 	}
-
-	// Pebble may have a higher revision from a prior crash-recovery; use it.
 	if dbRev := db.CurrentRevision(); dbRev > startRev {
 		startRev = dbRev
 	}
 
-	// ── Step 3: open WAL and replay local + remote segments ─────────────────
+	// ── Open WAL ─────────────────────────────────────────────────────────────
+	// Leaders upload WAL segments to S3; followers use local WAL for crash
+	// recovery only (no uploader).
 	var uploader wal.Uploader
-	if cfg.ObjectStore != nil {
+	if cfg.ObjectStore != nil && cfg.PeerListenAddr == "" {
+		// single-node: always upload
 		uploader = makeUploader(cfg.ObjectStore)
 	}
+	// Multi-node: leader sets uploader after election; follower keeps nil.
 
 	w, err := wal.Open(walDir, term, startRev+1,
 		wal.WithUploader(uploader),
@@ -112,15 +137,14 @@ func Open(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("strata: open wal: %w", err)
 	}
 
-	// Replay local segments that postdate startRev.
+	// ── Replay local WAL ─────────────────────────────────────────────────────
 	if err := replayLocal(db, walDir, startRev); err != nil {
 		w.Close()
 		db.Close()
 		return nil, fmt.Errorf("strata: local WAL replay: %w", err)
 	}
 
-	// If object storage is configured, also replay remote segments
-	// that postdate the checkpoint.
+	// ── Replay remote WAL (S3) ───────────────────────────────────────────────
 	if cfg.ObjectStore != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
@@ -142,26 +166,153 @@ func Open(cfg Config) (*Node, error) {
 
 	w.Start(bgCtx)
 
-	if cfg.ObjectStore != nil && cfg.CheckpointInterval > 0 {
+	// ── Determine role ───────────────────────────────────────────────────────
+	if cfg.PeerListenAddr == "" || cfg.ObjectStore == nil {
+		n.role = roleSingle
+	} else {
+		if err := n.electAndStart(bgCtx); err != nil {
+			bgCancel()
+			w.Close()
+			db.Close()
+			return nil, err
+		}
+	}
+
+	// ── Background jobs ──────────────────────────────────────────────────────
+	if n.role != roleFollower && cfg.ObjectStore != nil && cfg.CheckpointInterval > 0 {
 		go n.checkpointLoop(bgCtx)
+	}
+	if n.role == roleFollower {
+		go n.followLoop(bgCtx)
 	}
 
 	return n, nil
 }
 
+// electAndStart runs leader election and configures the node as leader or follower.
+func (n *Node) electAndStart(bgCtx context.Context) error {
+	lock := election.NewLock(n.cfg.ObjectStore, n.cfg.NodeID, n.cfg.AdvertisePeerAddr, n.cfg.LockTTL)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rec, won, err := lock.TryAcquire(ctx, n.term)
+	if err != nil {
+		return fmt.Errorf("strata: election: %w", err)
+	}
+
+	if won {
+		n.role = roleLeader
+		n.term = rec.Term
+		// Re-open WAL with the S3 uploader now that we know we're the leader.
+		n.wal.Close()
+		walDir := filepath.Join(n.cfg.DataDir, "wal")
+		w2, err := wal.Open(walDir, n.term, n.db.CurrentRevision()+1,
+			wal.WithUploader(makeUploader(n.cfg.ObjectStore)),
+			wal.WithSegmentMaxSize(n.cfg.SegmentMaxSize),
+			wal.WithSegmentMaxAge(n.cfg.SegmentMaxAge),
+		)
+		if err != nil {
+			return fmt.Errorf("strata: reopen WAL as leader: %w", err)
+		}
+		n.wal = w2
+		w2.Start(bgCtx)
+
+		// Start peer gRPC server for followers.
+		n.peerSrv = peer.NewServer(n.cfg.PeerBufferSize)
+		lis, err := net.Listen("tcp", n.cfg.PeerListenAddr)
+		if err != nil {
+			return fmt.Errorf("strata: peer listen %s: %w", n.cfg.PeerListenAddr, err)
+		}
+		n.peerLis = lis
+		srv := grpc.NewServer(grpc.ForceServerCodec(peer.Codec{}))
+		peer.RegisterWalStreamServer(srv, n.peerSrv)
+		go func() {
+			if err := srv.Serve(lis); err != nil {
+				logrus.Warnf("strata: peer server: %v", err)
+			}
+		}()
+		logrus.Infof("strata: elected leader (term=%d, peer=%s)", n.term, n.cfg.PeerListenAddr)
+
+		// Renew lease in background.
+		go n.renewLoop(bgCtx, lock, n.term)
+	} else {
+		n.role = roleFollower
+		n.peerCli = peer.NewClient(rec.LeaderAddr, n.cfg.NodeID)
+		logrus.Infof("strata: following leader at %s (term=%d)", rec.LeaderAddr, rec.Term)
+	}
+	return nil
+}
+
+// renewLoop renews the leader lease on a ticker. Steps down if renewal fails.
+func (n *Node) renewLoop(ctx context.Context, lock *election.Lock, term uint64) {
+	ticker := time.NewTicker(n.cfg.LockRenewInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			rCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := lock.Renew(rCtx, term)
+			cancel()
+			if err != nil {
+				logrus.Errorf("strata: lease renewal failed — stepping down: %v", err)
+				n.cancelBg()
+				return
+			}
+		case <-ctx.Done():
+			rCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			lock.Release(rCtx)
+			cancel()
+			return
+		}
+	}
+}
+
+// followLoop receives WAL entries from the leader and applies them locally.
+func (n *Node) followLoop(ctx context.Context) {
+	fromRev := n.db.CurrentRevision() + 1
+	err := n.peerCli.Follow(ctx, fromRev, func(e wal.Entry) error {
+		// Write to local WAL for crash-recovery, then apply to Pebble.
+		if err := n.wal.Append(&e); err != nil {
+			return err
+		}
+		return n.db.Apply([]wal.Entry{e})
+	})
+	if err != nil && ctx.Err() == nil {
+		if peer.IsResyncRequired(err) {
+			logrus.Error("strata: follower resync required — restart the node to re-bootstrap from S3")
+		} else {
+			logrus.Errorf("strata: follow loop exited: %v", err)
+		}
+	}
+}
+
 // Close shuts down the node cleanly.
 func (n *Node) Close() error {
 	n.cancelBg()
+	if n.peerLis != nil {
+		n.peerLis.Close()
+	}
 	if err := n.wal.Close(); err != nil {
 		logrus.Errorf("strata: wal close: %v", err)
 	}
 	return n.db.Close()
 }
 
-// ── Write path ────────────────────────────────────────────────────────────────
+// ── Write path (leader / single-node only) ────────────────────────────────────
+
+func (n *Node) requireLeader() error {
+	if n.role == roleFollower {
+		return ErrNotLeader
+	}
+	return nil
+}
 
 // Put creates or updates key with value. Returns the new revision.
 func (n *Node) Put(ctx context.Context, key string, value []byte, lease int64) (int64, error) {
+	if err := n.requireLeader(); err != nil {
+		return 0, err
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.putLocked(key, value, lease)
@@ -174,32 +325,25 @@ func (n *Node) putLocked(key string, value []byte, lease int64) (int64, error) {
 	}
 	curRev := n.db.CurrentRevision()
 	newRev := curRev + 1
-
 	var op wal.Op
 	var createRev, prevRev int64
 	if existing == nil {
-		op = wal.OpCreate
-		createRev = newRev
+		op, createRev = wal.OpCreate, newRev
 	} else {
-		op = wal.OpUpdate
-		createRev = existing.CreateRevision
-		prevRev = existing.Revision
+		op, createRev, prevRev = wal.OpUpdate, existing.CreateRevision, existing.Revision
 	}
 	return n.appendAndApply(wal.Entry{
-		Revision:       newRev,
-		Term:           n.term,
-		Op:             op,
-		Key:            key,
-		Value:          value,
-		Lease:          lease,
-		CreateRevision: createRev,
-		PrevRevision:   prevRev,
+		Revision: newRev, Term: n.term, Op: op,
+		Key: key, Value: value, Lease: lease,
+		CreateRevision: createRev, PrevRevision: prevRev,
 	})
 }
 
 // Create creates key only if it does not already exist.
-// Returns (newRev, nil) on success; (0, ErrKeyExists) if already present.
 func (n *Node) Create(ctx context.Context, key string, value []byte, lease int64) (int64, error) {
+	if err := n.requireLeader(); err != nil {
+		return 0, err
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	existing, err := n.db.Get(key)
@@ -212,19 +356,16 @@ func (n *Node) Create(ctx context.Context, key string, value []byte, lease int64
 	curRev := n.db.CurrentRevision()
 	newRev := curRev + 1
 	return n.appendAndApply(wal.Entry{
-		Revision:       newRev,
-		Term:           n.term,
-		Op:             wal.OpCreate,
-		Key:            key,
-		Value:          value,
-		Lease:          lease,
-		CreateRevision: newRev,
+		Revision: newRev, Term: n.term, Op: wal.OpCreate,
+		Key: key, Value: value, Lease: lease, CreateRevision: newRev,
 	})
 }
 
-// Update updates key only if its current revision matches revision (CAS).
-// Returns (newRev, oldKV, true, nil) on match; (currentRev, currentKV, false, nil) on mismatch.
+// Update updates key only if its current revision matches (CAS).
 func (n *Node) Update(ctx context.Context, key string, value []byte, revision, lease int64) (int64, *KeyValue, bool, error) {
+	if err := n.requireLeader(); err != nil {
+		return 0, nil, false, err
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	existing, err := n.db.Get(key)
@@ -236,14 +377,9 @@ func (n *Node) Update(ctx context.Context, key string, value []byte, revision, l
 		return curRev, toKV(existing), false, nil
 	}
 	newRev, err := n.appendAndApply(wal.Entry{
-		Revision:       curRev + 1,
-		Term:           n.term,
-		Op:             wal.OpUpdate,
-		Key:            key,
-		Value:          value,
-		Lease:          lease,
-		CreateRevision: existing.CreateRevision,
-		PrevRevision:   existing.Revision,
+		Revision: curRev + 1, Term: n.term, Op: wal.OpUpdate,
+		Key: key, Value: value, Lease: lease,
+		CreateRevision: existing.CreateRevision, PrevRevision: existing.Revision,
 	})
 	if err != nil {
 		return 0, nil, false, err
@@ -251,17 +387,21 @@ func (n *Node) Update(ctx context.Context, key string, value []byte, revision, l
 	return newRev, toKV(existing), true, nil
 }
 
-// Delete removes key. Returns the new (tombstone) revision, or 0 if not found.
+// Delete removes key unconditionally.
 func (n *Node) Delete(ctx context.Context, key string) (int64, error) {
+	if err := n.requireLeader(); err != nil {
+		return 0, err
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return n.deleteLocked(key, 0)
+	return n.deleteLocked(key)
 }
 
-// DeleteIfRevision deletes key only if its current revision == revision (CAS).
-// revision==0 means unconditional delete.
-// Returns (newRev, oldKV, true, nil) on success; (currentRev, currentKV, false, nil) on mismatch.
+// DeleteIfRevision deletes key only if its current revision matches (CAS).
 func (n *Node) DeleteIfRevision(ctx context.Context, key string, revision int64) (int64, *KeyValue, bool, error) {
+	if err := n.requireLeader(); err != nil {
+		return 0, nil, false, err
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	existing, err := n.db.Get(key)
@@ -275,32 +415,26 @@ func (n *Node) DeleteIfRevision(ctx context.Context, key string, revision int64)
 	if revision != 0 && existing.Revision != revision {
 		return curRev, toKV(existing), false, nil
 	}
-	newRev, err := n.deleteLocked(key, revision)
+	newRev, err := n.deleteLocked(key)
 	if err != nil {
 		return 0, nil, false, err
 	}
 	return newRev, toKV(existing), true, nil
 }
 
-func (n *Node) deleteLocked(key string, _ int64) (int64, error) {
+func (n *Node) deleteLocked(key string) (int64, error) {
 	existing, err := n.db.Get(key)
-	if err != nil {
+	if err != nil || existing == nil {
 		return 0, err
-	}
-	if existing == nil {
-		return 0, nil
 	}
 	curRev := n.db.CurrentRevision()
 	return n.appendAndApply(wal.Entry{
-		Revision:       curRev + 1,
-		Term:           n.term,
-		Op:             wal.OpDelete,
-		Key:            key,
-		CreateRevision: existing.CreateRevision,
-		PrevRevision:   existing.Revision,
+		Revision: curRev + 1, Term: n.term, Op: wal.OpDelete,
+		Key: key, CreateRevision: existing.CreateRevision, PrevRevision: existing.Revision,
 	})
 }
 
+// appendAndApply writes e to WAL, applies to store, and broadcasts to followers.
 func (n *Node) appendAndApply(e wal.Entry) (int64, error) {
 	if err := n.wal.Append(&e); err != nil {
 		return 0, fmt.Errorf("strata: wal append: %w", err)
@@ -309,12 +443,14 @@ func (n *Node) appendAndApply(e wal.Entry) (int64, error) {
 		return 0, fmt.Errorf("strata: apply: %w", err)
 	}
 	atomic.AddInt64(&n.entriesSinceCheckpoint, 1)
+	if n.peerSrv != nil {
+		n.peerSrv.Broadcast(&e)
+	}
 	return e.Revision, nil
 }
 
-// ── Read path ─────────────────────────────────────────────────────────────────
+// ── Read path (all roles) ─────────────────────────────────────────────────────
 
-// Get returns the current value for key, or nil if not found.
 func (n *Node) Get(key string) (*KeyValue, error) {
 	sv, err := n.db.Get(key)
 	if err != nil || sv == nil {
@@ -323,7 +459,6 @@ func (n *Node) Get(key string) (*KeyValue, error) {
 	return toKV(sv), nil
 }
 
-// List returns all live keys with the given prefix.
 func (n *Node) List(prefix string) ([]*KeyValue, error) {
 	svs, err := n.db.List(prefix)
 	if err != nil {
@@ -336,19 +471,16 @@ func (n *Node) List(prefix string) ([]*KeyValue, error) {
 	return out, nil
 }
 
-// Count returns the number of live keys with the given prefix.
-func (n *Node) Count(prefix string) (int64, error) {
-	return n.db.Count(prefix)
+func (n *Node) Count(prefix string) (int64, error) { return n.db.Count(prefix) }
+func (n *Node) CurrentRevision() int64             { return n.db.CurrentRevision() }
+func (n *Node) CompactRevision() int64             { return n.db.CompactRevision() }
+func (n *Node) Config() Config                     { return n.cfg }
+func (n *Node) IsLeader() bool                     { return n.role != roleFollower }
+
+func (n *Node) WaitForRevision(ctx context.Context, rev int64) error {
+	return n.db.WaitForRevision(ctx, rev)
 }
 
-// CurrentRevision returns the latest applied revision.
-func (n *Node) CurrentRevision() int64 { return n.db.CurrentRevision() }
-
-// CompactRevision returns the oldest available revision.
-func (n *Node) CompactRevision() int64 { return n.db.CompactRevision() }
-
-// Watch streams events for keys matching prefix from startRev+1 onwards.
-// The returned channel is closed when ctx is cancelled.
 func (n *Node) Watch(ctx context.Context, prefix string, startRev int64) (<-chan Event, error) {
 	sch, err := n.db.Watch(ctx, prefix, startRev)
 	if err != nil {
@@ -362,10 +494,7 @@ func (n *Node) Watch(ctx context.Context, prefix string, startRev int64) (<-chan
 			if ev.Deleted {
 				et = EventDelete
 			}
-			ne := Event{
-				Type: et,
-				KV:   toKV(ev.KV),
-			}
+			ne := Event{Type: et, KV: toKV(ev.KV)}
 			if ev.PrevKV != nil {
 				ne.PrevKV = toKV(ev.PrevKV)
 			}
@@ -379,29 +508,26 @@ func (n *Node) Watch(ctx context.Context, prefix string, startRev int64) (<-chan
 	return out, nil
 }
 
-// Config returns the node's configuration.
-func (n *Node) Config() Config { return n.cfg }
-
-// WaitForRevision blocks until CurrentRevision() >= rev or ctx is cancelled.
-// In single-node mode this returns immediately since the node is always current.
-func (n *Node) WaitForRevision(ctx context.Context, rev int64) error {
-	return n.db.WaitForRevision(ctx, rev)
-}
-
-// Compact removes log entries at or below revision and advances CompactRevision.
+// Compact removes log entries at or below revision.
 func (n *Node) Compact(ctx context.Context, revision int64) error {
+	if err := n.requireLeader(); err != nil {
+		return err
+	}
 	curRev := n.db.CurrentRevision()
-	newRev := curRev + 1
 	e := wal.Entry{
-		Revision:     newRev,
-		Term:         n.term,
-		Op:           wal.OpCompact,
-		PrevRevision: revision, // repurpose PrevRevision to carry the compact target
+		Revision: curRev + 1, Term: n.term, Op: wal.OpCompact,
+		PrevRevision: revision,
 	}
 	if err := n.wal.Append(&e); err != nil {
 		return fmt.Errorf("strata: compact wal append: %w", err)
 	}
-	return n.db.Apply([]wal.Entry{e})
+	if err := n.db.Apply([]wal.Entry{e}); err != nil {
+		return err
+	}
+	if n.peerSrv != nil {
+		n.peerSrv.Broadcast(&e)
+	}
+	return nil
 }
 
 // ── Background checkpoint loop ────────────────────────────────────────────────
@@ -421,20 +547,16 @@ func (n *Node) checkpointLoop(ctx context.Context) {
 
 func (n *Node) maybeCheckpoint(ctx context.Context) {
 	if atomic.LoadInt64(&n.entriesSinceCheckpoint) == 0 {
-		return // nothing new since the last checkpoint
+		return
 	}
 	rev := n.db.CurrentRevision()
 	if rev == 0 {
 		return
 	}
-
-	// Seal and flush the current WAL segment before snapshotting.
 	if err := n.wal.SealAndFlush(rev + 1); err != nil {
 		logrus.Errorf("strata: checkpoint seal WAL: %v", err)
 		return
 	}
-
-	// TODO: pass last uploaded WAL object key once the upload loop exposes it.
 	if err := checkpoint.Write(ctx, n.db.Pebble(), n.cfg.ObjectStore, n.term, rev, ""); err != nil {
 		logrus.Errorf("strata: write checkpoint rev=%d: %v", rev, err)
 		return
@@ -450,17 +572,12 @@ func toKV(sv *istore.KeyValue) *KeyValue {
 		return nil
 	}
 	return &KeyValue{
-		Key:            sv.Key,
-		Value:          sv.Value,
-		Revision:       sv.Revision,
-		CreateRevision: sv.CreateRevision,
-		PrevRevision:   sv.PrevRevision,
-		Lease:          sv.Lease,
+		Key: sv.Key, Value: sv.Value, Revision: sv.Revision,
+		CreateRevision: sv.CreateRevision, PrevRevision: sv.PrevRevision,
+		Lease: sv.Lease,
 	}
 }
 
-// makeUploader returns a wal.Uploader that streams a local file to object
-// storage and removes it on success.
 func makeUploader(obj object.Store) wal.Uploader {
 	return func(ctx context.Context, localPath, objectKey string) error {
 		f, err := os.Open(localPath)
