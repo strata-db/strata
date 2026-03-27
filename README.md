@@ -1,5 +1,10 @@
 # Strata
 
+[![CI](https://github.com/makhov/strata/actions/workflows/ci.yml/badge.svg)](https://github.com/makhov/strata/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/makhov/strata.svg)](https://pkg.go.dev/github.com/makhov/strata)
+[![Go Report Card](https://goreportcard.com/badge/github.com/makhov/strata)](https://goreportcard.com/report/github.com/makhov/strata)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 An embeddable, S3-durable key-value store for Go.
 
 - **Embedded-first** — `strata.Open(cfg)` is the entire API. No sidecar, no daemon.

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race)
+        run: go test -race -timeout 300s -count=1 ./...
+
+  benchmark:
+    name: Benchmark
+    runs-on: ubuntu-latest
+    # Only run on pushes to master to avoid noise on every PR commit.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Benchmark (root package)
+        run: |
+          go test -bench=. -benchtime=5s -benchmem -run='^$' . \
+            | tee bench-root.txt
+          cat bench-root.txt
+
+      - name: Benchmark (etcd adapter)
+        run: |
+          go test -bench=. -benchtime=5s -benchmem -run='^$' ./etcd/ \
+            | tee bench-etcd.txt
+          cat bench-etcd.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-${{ github.sha }}
+          path: bench-*.txt
+          retention-days: 90
