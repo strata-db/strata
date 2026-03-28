@@ -2,6 +2,7 @@ package wal
 
 import (
 	"io"
+	"math"
 	"testing"
 )
 
@@ -76,6 +77,46 @@ func TestSegmentName(t *testing.T) {
 	want := "0000000001-00000000000000000042.wal"
 	if name != want {
 		t.Errorf("SegmentName: want %q got %q", want, name)
+	}
+}
+
+func TestParseSegmentName(t *testing.T) {
+	// Round-trip: ParseSegmentName inverts SegmentName.
+	cases := []struct {
+		term     uint64
+		firstRev int64
+	}{
+		{1, 1},
+		{7, 42},
+		{0, 0},
+		{math.MaxUint32, math.MaxInt32},
+	}
+	for _, tc := range cases {
+		name := SegmentName(tc.term, tc.firstRev)
+		gotTerm, gotRev, ok := ParseSegmentName(name)
+		if !ok {
+			t.Errorf("ParseSegmentName(%q): ok=false", name)
+			continue
+		}
+		if gotTerm != tc.term || gotRev != tc.firstRev {
+			t.Errorf("ParseSegmentName(%q): want (%d, %d) got (%d, %d)",
+				name, tc.term, tc.firstRev, gotTerm, gotRev)
+		}
+	}
+
+	// Works without the .wal suffix.
+	term, rev, ok := ParseSegmentName("0000000003-00000000000000000010")
+	if !ok || term != 3 || rev != 10 {
+		t.Errorf("without suffix: want (3,10,true) got (%d,%d,%v)", term, rev, ok)
+	}
+
+	// Invalid inputs return ok=false.
+	invalid := []string{"", "notawalfile.wal", "abc-def.wal", "no-dash"}
+	for _, s := range invalid {
+		_, _, ok := ParseSegmentName(s)
+		if ok {
+			t.Errorf("ParseSegmentName(%q): want ok=false", s)
+		}
 	}
 }
 

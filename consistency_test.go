@@ -2,6 +2,7 @@ package strata_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -17,10 +18,17 @@ func checkConsistency(t *testing.T, ctx context.Context, nodes []*strata.Node, p
 	t.Helper()
 	for i, n := range nodes {
 		if err := n.WaitForRevision(ctx, minRev); err != nil {
+			if errors.Is(err, strata.ErrClosed) {
+				// Node was removed during chaos — skip it.
+				continue
+			}
 			t.Fatalf("node-%d WaitForRevision(%d): %v", i, minRev, err)
 		}
 		for key, wantVal := range want {
 			kv, err := n.Get(key)
+			if errors.Is(err, strata.ErrClosed) {
+				break // node closed mid-check; skip remaining keys for this node
+			}
 			if err != nil {
 				t.Errorf("node-%d Get(%q): %v", i, key, err)
 				continue
@@ -34,11 +42,17 @@ func checkConsistency(t *testing.T, ctx context.Context, nodes []*strata.Node, p
 			}
 		}
 		kvs, err := n.List(prefix)
+		if errors.Is(err, strata.ErrClosed) {
+			continue
+		}
 		if err != nil {
 			t.Errorf("node-%d List(%q): %v", i, prefix, err)
 			continue
 		}
-		if len(kvs) != len(want) {
+		// More keys than want is acceptable: writes whose ACK was lost in
+		// transit (client saw an error but the leader had already committed)
+		// are durable and correct. Only fewer keys than expected is a bug.
+		if len(kvs) < len(want) {
 			t.Errorf("node-%d List(%q): want %d keys got %d", i, prefix, len(want), len(kvs))
 		}
 	}

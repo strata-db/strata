@@ -32,6 +32,7 @@ import (
 var (
 	ErrKeyExists = errors.New("strata: key already exists")
 	ErrNotLeader = errors.New("strata: this node is not the leader; writes are rejected")
+	ErrClosed    = errors.New("strata: node is closed")
 )
 
 // nodeRole identifies whether the node is leader, follower, or single-node.
@@ -85,6 +86,7 @@ type Node struct {
 	entriesSinceCheckpoint int64
 	cancelBg               context.CancelFunc
 	closeOnce              sync.Once
+	closed                 atomic.Bool
 	bgWg                   sync.WaitGroup // tracks long-running background goroutines (followLoop, checkpointLoop)
 }
 
@@ -99,8 +101,9 @@ func Open(cfg Config) (*Node, error) {
 	walDir := filepath.Join(cfg.DataDir, "wal")
 
 	var (
-		startRev int64
-		term     uint64 = 1
+		startRev  int64
+		term      uint64 = 1
+		freshNode bool   // true when pebble was restored from a checkpoint (not a restart)
 	)
 
 	// ── Restore checkpoint ───────────────────────────────────────────────────
@@ -139,6 +142,7 @@ func Open(cfg Config) (*Node, error) {
 				}
 				term, startRev = t, rev
 				logrus.Infof("strata: checkpoint restored (term=%d rev=%d)", term, startRev)
+				freshNode = true
 			}
 		}
 	}
@@ -148,9 +152,14 @@ func Open(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("strata: open store: %w", err)
 	}
-	if dbRev := db.CurrentRevision(); dbRev > startRev {
-		startRev = dbRev
-	}
+	// Always derive startRev from pebble's actual revision, not the checkpoint
+	// header. A Compact entry does not write a pebble log key, so after a
+	// restore loadMeta() returns a revision one less than the compact's revision
+	// even though the checkpoint header records the compact's (higher) revision.
+	// Using the checkpoint header as afterRev would cause replayRemote to skip
+	// that compact entry. Local WAL replay (below) may advance pebble further,
+	// so we re-read after replay as well.
+	startRev = db.CurrentRevision()
 
 	// ── Open WAL ─────────────────────────────────────────────────────────────
 	var uploader wal.Uploader
@@ -174,6 +183,8 @@ func Open(cfg Config) (*Node, error) {
 		db.Close()
 		return nil, fmt.Errorf("strata: local WAL replay: %w", err)
 	}
+	// Re-read pebble's revision: local WAL replay may have advanced it.
+	startRev = db.CurrentRevision()
 
 	// ── Replay remote WAL (S3) ───────────────────────────────────────────────
 	switch {
@@ -188,6 +199,48 @@ func Open(cfg Config) (*Node, error) {
 	case cfg.ObjectStore != nil:
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
+
+		// Close the GC race: between the initial manifest read and now, the leader
+		// may have written a newer checkpoint and GC'd the WAL segments that span
+		// [startRev+1, newCheckpointRev]. Re-reading the manifest and re-restoring
+		// from the fresher checkpoint means replayRemote only needs segments the
+		// leader hasn't yet deleted.
+		if freshNode {
+			if freshManifest, merr := checkpoint.ReadManifest(ctx, cfg.ObjectStore); merr == nil &&
+				freshManifest != nil && freshManifest.Revision > startRev {
+				logrus.Infof("strata: fresher checkpoint available (rev=%d > startRev=%d); re-restoring to close GC race", freshManifest.Revision, startRev)
+				db.Close()
+				if rerr := os.RemoveAll(pebbleDir); rerr != nil {
+					w.Close()
+					return nil, fmt.Errorf("strata: remove stale pebble dir: %w", rerr)
+				}
+				newTerm, newRev, rerr := checkpoint.Restore(ctx, cfg.ObjectStore, freshManifest.CheckpointKey, pebbleDir)
+				if rerr != nil {
+					w.Close()
+					return nil, fmt.Errorf("strata: re-restore checkpoint: %w", rerr)
+				}
+				freshDB, rerr := istore.Open(pebbleDir)
+				if rerr != nil {
+					w.Close()
+					return nil, fmt.Errorf("strata: reopen store after checkpoint refresh: %w", rerr)
+				}
+				w.Close()
+				freshW, rerr := wal.Open(walDir, newTerm, newRev+1,
+					wal.WithUploader(uploader),
+					wal.WithSegmentMaxSize(cfg.SegmentMaxSize),
+					wal.WithSegmentMaxAge(cfg.SegmentMaxAge),
+				)
+				if rerr != nil {
+					freshDB.Close()
+					return nil, fmt.Errorf("strata: reopen wal after checkpoint refresh: %w", rerr)
+				}
+				// Use pebble's actual currentRev as startRev (same reasoning as
+				// after the initial pebble open above).
+				db, w, term, startRev = freshDB, freshW, newTerm, freshDB.CurrentRevision()
+				logrus.Infof("strata: checkpoint refreshed to rev=%d (term=%d)", startRev, term)
+			}
+		}
+
 		if err := replayRemote(ctx, db, cfg.ObjectStore, startRev); err != nil {
 			w.Close()
 			db.Close()
@@ -309,6 +362,32 @@ func (n *Node) electAndStart(bgCtx context.Context) error {
 func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *election.LockRecord) error {
 	n.wal.Close()
 	walDir := filepath.Join(n.cfg.DataDir, "wal")
+
+	// Upload any local WAL segments that were not yet in S3. This covers the
+	// same-node re-election case where the previous WAL had no uploader (or
+	// crashed before the upload completed). The immediate startup checkpoint
+	// written by checkpointLoop also covers these entries, but uploading them
+	// first narrows the window where a crash could lose data.
+	upCtx, upCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	uploadLocalWALSegments(upCtx, walDir, n.cfg.ObjectStore)
+	upCancel()
+
+	// Replay any remote WAL entries not yet in our Pebble. A follower that wins
+	// election may be behind the former leader: the former leader may have
+	// committed entries and uploaded them to S3 before it closed, but this node
+	// never received them via the stream. Without this replay the new leader
+	// would open its WAL at a firstRev that is lower than some committed entries
+	// still in S3. The subsequent checkpoint + GC would then delete those S3
+	// segments while the checkpoint only covers the new (lower) revision —
+	// permanently losing the committed entries.
+	if n.cfg.ObjectStore != nil {
+		reCtx, reCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		if err := replayRemote(reCtx, n.db, n.cfg.ObjectStore, n.db.CurrentRevision()); err != nil {
+			logrus.Warnf("strata: becomeLeader replay remote WAL: %v (proceeding)", err)
+		}
+		reCancel()
+	}
+
 	w2, err := wal.Open(walDir, rec.Term, n.db.CurrentRevision()+1,
 		wal.WithUploader(makeUploader(n.cfg.ObjectStore)),
 		wal.WithSegmentMaxSize(n.cfg.SegmentMaxSize),
@@ -596,6 +675,7 @@ func msgToKV(m *peer.KVMsg) *KeyValue {
 func (n *Node) Close() error {
 	var err error
 	n.closeOnce.Do(func() {
+		n.closed.Store(true)
 		n.cancelBg()
 		if cli := n.leaderCli.Load(); cli != nil {
 			cli.Close()
@@ -624,6 +704,9 @@ func (n *Node) Close() error {
 
 // Put creates or updates key with value. Returns the new revision.
 func (n *Node) Put(ctx context.Context, key string, value []byte, lease int64) (int64, error) {
+	if n.closed.Load() {
+		return 0, ErrClosed
+	}
 	if n.loadRole() == roleFollower {
 		resp, err := n.forwardWrite(ctx, &peer.ForwardRequest{Op: peer.ForwardPut, Key: key, Value: value, Lease: lease})
 		if err != nil {
@@ -814,6 +897,8 @@ func (n *Node) Compact(ctx context.Context, revision int64) error {
 		}
 		return decodeErr(resp.ErrCode, resp.ErrMsg)
 	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	curRev := n.db.CurrentRevision()
 	e := wal.Entry{
 		Revision: curRev + 1, Term: n.term, Op: wal.OpCompact,
@@ -834,6 +919,9 @@ func (n *Node) Compact(ctx context.Context, revision int64) error {
 // ── Read path (all roles serve locally) ──────────────────────────────────────
 
 func (n *Node) Get(key string) (*KeyValue, error) {
+	if n.closed.Load() {
+		return nil, ErrClosed
+	}
 	sv, err := n.db.Get(key)
 	if err != nil || sv == nil {
 		return nil, err
@@ -842,6 +930,9 @@ func (n *Node) Get(key string) (*KeyValue, error) {
 }
 
 func (n *Node) List(prefix string) ([]*KeyValue, error) {
+	if n.closed.Load() {
+		return nil, ErrClosed
+	}
 	svs, err := n.db.List(prefix)
 	if err != nil {
 		return nil, err
@@ -860,6 +951,9 @@ func (n *Node) Config() Config                     { return n.cfg }
 func (n *Node) IsLeader() bool                     { return n.loadRole() != roleFollower }
 
 func (n *Node) WaitForRevision(ctx context.Context, rev int64) error {
+	if n.closed.Load() {
+		return ErrClosed
+	}
 	return n.db.WaitForRevision(ctx, rev)
 }
 
@@ -890,9 +984,49 @@ func (n *Node) Watch(ctx context.Context, prefix string, startRev int64) (<-chan
 	return out, nil
 }
 
+// uploadLocalWALSegments uploads any sealed local WAL segment files that are
+// not yet present in S3. This is called when becoming leader so that local
+// entries (recovered via replayLocal) are durable in object storage before
+// followers can bootstrap.
+func uploadLocalWALSegments(ctx context.Context, walDir string, store object.Store) {
+	paths, err := wal.LocalSegments(walDir)
+	if err != nil || len(paths) == 0 {
+		return
+	}
+
+	// Build set of keys already in S3 to skip redundant uploads.
+	s3Keys, _ := store.List(ctx, "wal/")
+	inS3 := make(map[string]struct{}, len(s3Keys))
+	for _, k := range s3Keys {
+		inS3[k] = struct{}{}
+	}
+
+	up := makeUploader(store)
+	for _, path := range paths {
+		term, firstRev, ok := wal.ParseSegmentName(filepath.Base(path))
+		if !ok {
+			continue
+		}
+		objKey := wal.ObjectKey(term, firstRev)
+		if _, exists := inS3[objKey]; exists {
+			continue // already uploaded
+		}
+		if err := up(ctx, path, objKey); err != nil {
+			logrus.Warnf("strata: pre-leader upload %q → %q: %v", path, objKey, err)
+		}
+	}
+}
+
 // ── Background checkpoint loop ────────────────────────────────────────────────
 
 func (n *Node) checkpointLoop(ctx context.Context) {
+	// Write an immediate checkpoint before entering the ticker so that any
+	// entries recovered from local WAL segments (but not yet in S3) are
+	// captured in the checkpoint. Without this, a crash after becoming leader
+	// but before the first periodic checkpoint could leave new followers unable
+	// to see those entries.
+	n.forceCheckpoint(ctx)
+
 	ticker := time.NewTicker(n.cfg.CheckpointInterval)
 	defer ticker.Stop()
 	for {
@@ -903,6 +1037,26 @@ func (n *Node) checkpointLoop(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// forceCheckpoint writes a checkpoint unconditionally (bypassing the
+// entriesSinceCheckpoint guard). Used on startup to capture local state.
+func (n *Node) forceCheckpoint(ctx context.Context) {
+	rev := n.db.CurrentRevision()
+	if rev == 0 {
+		return
+	}
+	if err := n.wal.SealAndFlush(rev + 1); err != nil {
+		logrus.Errorf("strata: startup checkpoint seal WAL: %v", err)
+		return
+	}
+	if err := checkpoint.Write(ctx, n.db.Pebble(), n.cfg.ObjectStore, n.term, rev, ""); err != nil {
+		logrus.Errorf("strata: startup checkpoint rev=%d: %v", rev, err)
+		return
+	}
+	atomic.StoreInt64(&n.entriesSinceCheckpoint, 0)
+	metrics.CheckpointsTotal.Inc()
+	logrus.Infof("strata: startup checkpoint written (rev=%d)", rev)
 }
 
 func (n *Node) maybeCheckpoint(ctx context.Context) {
@@ -954,7 +1108,23 @@ func makeUploader(obj object.Store) wal.Uploader {
 	return func(ctx context.Context, localPath, objectKey string) error {
 		f, err := os.Open(localPath)
 		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				metrics.WALUploadErrors.Inc()
+				return fmt.Errorf("uploader: open %q: %w", localPath, err)
+			}
+			// Local file is gone. Verify the segment reached S3; if it did the
+			// uploader already completed on a previous attempt (idempotent).
+			// If it didn't, the data is irrecoverably lost — log loudly.
+			chkCtx, chkCancel := context.WithTimeout(ctx, 10*time.Second)
+			rc, s3Err := obj.Get(chkCtx, objectKey)
+			chkCancel()
+			if s3Err == nil {
+				rc.Close()
+				logrus.Debugf("uploader: local file %q already gone but %q exists in S3 — treating as success", localPath, objectKey)
+				return nil
+			}
 			metrics.WALUploadErrors.Inc()
+			logrus.Errorf("uploader: local file %q is gone AND %q is not in S3 — segment data is lost", localPath, objectKey)
 			return fmt.Errorf("uploader: open %q: %w", localPath, err)
 		}
 		defer f.Close()

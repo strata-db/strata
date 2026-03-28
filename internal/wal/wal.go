@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -215,6 +216,11 @@ func (w *WAL) uploadLoop(ctx context.Context) {
 					return
 				}
 				logrus.Errorf("wal: upload %q → %q: %v", task.localPath, task.objectKey, err)
+				// If the local file is gone the segment was already uploaded and
+				// cleaned up (or discarded as empty). Retrying cannot help.
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
 				// Re-queue with a delay so we don't spin on transient S3 errors.
 				go func(t uploadTask) {
 					select {
@@ -259,24 +265,48 @@ func (w *WAL) Close() error {
 	}
 	w.mu.Unlock()
 
-	// Upload the final segment synchronously before cancelling the upload loop
-	// so a replacement node can recover all acknowledged writes from object
-	// storage. The upload loop is still running at this point.
-	var uploadErr error
-	if finalSeg != nil && w.uploader != nil {
-		objKey := ObjectKey(finalSeg.Term(), finalSeg.FirstRev())
-		uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		uploadErr = w.uploader(uploadCtx, finalSeg.Path(), objKey)
-		uploadCancel()
-		if uploadErr != nil {
-			logrus.Errorf("wal: close upload final segment: %v", uploadErr)
-		}
-	}
-
+	// Stop background loops first; after wg.Wait() the upload loop has fully
+	// exited and we own uploadC exclusively for synchronous draining below.
 	if w.cancelLoops != nil {
 		w.cancelLoops()
 	}
 	w.wg.Wait()
+
+	if w.uploader == nil {
+		return nil
+	}
+
+	// Drain any segments that were sealed and queued before Close() was called
+	// but not yet uploaded (the upload loop may have exited mid-queue due to
+	// context cancellation).  Then upload the final segment.  All uploads use a
+	// fresh context so they are not affected by the already-cancelled bgCtx.
+	uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer uploadCancel()
+
+	var uploadErr error
+	for {
+		select {
+		case task := <-w.uploadC:
+			if err := w.uploader(uploadCtx, task.localPath, task.objectKey); err != nil {
+				logrus.Errorf("wal: close drain upload %q: %v", task.localPath, err)
+				if uploadErr == nil {
+					uploadErr = err
+				}
+			}
+		default:
+			goto drained
+		}
+	}
+drained:
+	if finalSeg != nil {
+		objKey := ObjectKey(finalSeg.Term(), finalSeg.FirstRev())
+		if err := w.uploader(uploadCtx, finalSeg.Path(), objKey); err != nil {
+			logrus.Errorf("wal: close upload final segment: %v", err)
+			if uploadErr == nil {
+				uploadErr = err
+			}
+		}
+	}
 	return uploadErr
 }
 

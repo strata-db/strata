@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 
+	"fmt"
+
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -47,12 +49,22 @@ func (s *Server) SetForwardHandler(h ForwardHandler) {
 func (s *Server) Broadcast(e *wal.Entry) {
 	s.mu.Lock()
 	s.buf.push(e)
+	var toKick []string
 	for id, ch := range s.followers {
 		select {
 		case ch <- e:
 		default:
-			logrus.Warnf("peer: follower %q too slow — dropping entry rev=%d; it will reconnect", id, e.Revision)
+			// Channel full: close it so Follow returns an error and the follower
+			// reconnects from its last applied revision, re-fetching the gap
+			// from the ring buffer. Silently dropping the entry and continuing
+			// would leave the follower with a permanent hole.
+			logrus.Warnf("peer: follower %q too slow — disconnecting to force resync at rev=%d", id, e.Revision)
+			toKick = append(toKick, id)
 		}
+	}
+	for _, id := range toKick {
+		close(s.followers[id])
+		delete(s.followers, id)
 	}
 	s.mu.Unlock()
 }
@@ -94,7 +106,13 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 
 	for {
 		select {
-		case e := <-ch:
+		case e, ok := <-ch:
+			if !ok {
+				// Channel was closed by Broadcast because the follower was too
+				// slow. Return a retriable error so the client reconnects and
+				// re-fetches the missed entries from the ring buffer.
+				return fmt.Errorf("follower stream closed: too slow, reconnect required")
+			}
 			if e.Revision <= maxSent {
 				continue
 			}

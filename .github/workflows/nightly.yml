@@ -1,0 +1,29 @@
+name: Nightly stress test
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # 02:00 UTC every night
+  workflow_dispatch: # allow manual trigger
+
+jobs:
+  stress:
+    name: Stress (30m)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: TestLongRunningConsistency (30m)
+        run: |
+          go test -run TestLongRunningConsistency -v -timeout 35m -count=1 .
+        env:
+          TEST_DURATION: 30m

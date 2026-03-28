@@ -3,6 +3,7 @@ package strata_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,8 +14,31 @@ import (
 	"time"
 
 	"github.com/makhov/strata"
+	"github.com/makhov/strata/internal/checkpoint"
 	"github.com/makhov/strata/pkg/object"
 )
+
+// ── walBlockingStore ──────────────────────────────────────────────────────────
+
+// walBlockingStore permanently fails all Put calls whose key starts with
+// "wal/", while letting checkpoint, manifest, and lock writes through.
+// This lets tests create scenarios where WAL segments are never in S3 but
+// checkpoints are, so the startup-checkpoint code path can be isolated.
+type walBlockingStore struct {
+	object.Store
+}
+
+func newWALBlockingStore() *walBlockingStore {
+	return &walBlockingStore{Store: object.NewMem()}
+}
+
+func (s *walBlockingStore) Put(ctx context.Context, key string, r io.Reader) error {
+	if strings.HasPrefix(key, "wal/") {
+		io.Copy(io.Discard, r) // consume reader so caller doesn't block
+		return errors.New("injected: WAL upload blocked")
+	}
+	return s.Store.Put(ctx, key, r)
+}
 
 // ── faultyStore ───────────────────────────────────────────────────────────────
 
@@ -539,5 +563,476 @@ func TestWALReplayAfterPartialUpload(t *testing.T) {
 	kvs, err := node.List("/wal/")
 	if err != nil || len(kvs) != 30 {
 		t.Errorf("List after restart: err=%v got %d (want 30)", err, len(kvs))
+	}
+}
+
+// ── TestStartupCheckpointCoversLocalWAL ──────────────────────────────────────
+
+// TestStartupCheckpointCoversLocalWAL verifies that when a node starts up with
+// data in Pebble that is not yet in S3 (e.g. because WAL upload was blocked),
+// the startup checkpoint written by checkpointLoop makes that data visible to
+// fresh nodes that bootstrap entirely from object storage.
+//
+// This exercises the forceCheckpoint call added to checkpointLoop.
+func TestStartupCheckpointCoversLocalWAL(t *testing.T) {
+	// walBlocking lets checkpoints/manifests through but drops all WAL PUTs,
+	// so the only path to S3 durability is via a checkpoint.
+	store := newWALBlockingStore()
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const prefix = "/cp-covers-wal/"
+
+	// ── Phase 1: write data, WAL segment never reaches S3 ────────────────────
+	func() {
+		node, err := strata.Open(strata.Config{
+			DataDir:            dir,
+			ObjectStore:        store,
+			CheckpointInterval: 24 * time.Hour, // no auto-checkpoint
+			SegmentMaxAge:      24 * time.Hour, // no auto-rotate
+			SegmentMaxSize:     500 << 20,
+		})
+		if err != nil {
+			t.Fatalf("phase-1 Open: %v", err)
+		}
+		for i := 0; i < 10; i++ {
+			if _, err := node.Put(ctx, fmt.Sprintf("%sk%d", prefix, i), []byte("v"), 0); err != nil {
+				t.Fatalf("phase-1 Put %d: %v", i, err)
+			}
+		}
+		node.Close() // ignores the WAL upload error
+	}()
+
+	// S3 has no WAL segments.
+	walKeys, _ := store.List(ctx, "wal/")
+	if len(walKeys) != 0 {
+		t.Fatalf("expected no WAL in S3 after phase-1, got %v", walKeys)
+	}
+
+	// ── Phase 2: restart node; startup checkpoint captures the local data ─────
+	func() {
+		node, err := strata.Open(strata.Config{
+			DataDir:            dir,
+			ObjectStore:        store,
+			CheckpointInterval: 50 * time.Millisecond, // allow startup checkpoint
+			SegmentMaxAge:      50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("phase-2 Open: %v", err)
+		}
+		defer node.Close()
+
+		// Wait long enough for the startup checkpoint to be written.
+		time.Sleep(500 * time.Millisecond)
+	}()
+
+	// ── Phase 3: fresh node, empty data dir, must see all data via checkpoint ─
+	fresh, err := strata.Open(strata.Config{
+		DataDir:     t.TempDir(), // no local state
+		ObjectStore: store,
+	})
+	if err != nil {
+		t.Fatalf("phase-3 Open: %v", err)
+	}
+	defer fresh.Close()
+
+	kvs, err := fresh.List(prefix)
+	if err != nil {
+		t.Fatalf("phase-3 List: %v", err)
+	}
+	if len(kvs) != 10 {
+		t.Errorf("phase-3: want 10 keys, got %d", len(kvs))
+	}
+	for i := 0; i < 10; i++ {
+		kv, err := fresh.Get(fmt.Sprintf("%sk%d", prefix, i))
+		if err != nil || kv == nil {
+			t.Errorf("phase-3 Get k%d: err=%v kv=%v", i, err, kv)
+		}
+	}
+}
+
+// ── TestConcurrentCompactAndPut ───────────────────────────────────────────────
+
+// TestConcurrentCompactAndPut is a regression test for the compact/put
+// revision-collision race. Before the fix, Compact and Put could both read the
+// same currentRev and produce entries with identical revisions. When Compact
+// broadcast first, the peer server's maxSent dedup filter silently dropped the
+// concurrent Put on every follower.
+func TestConcurrentCompactAndPut(t *testing.T) {
+	store := object.NewMem()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	nodes := openCluster(t, 3, store)
+	leader := waitForLeaderNode(t, nodes, 10*time.Second)
+
+	// Hammer concurrent Puts and Compacts. Track which Puts the leader acknowledged.
+	const rounds = 80
+	var (
+		mu        sync.Mutex
+		committed []string
+	)
+	var wg sync.WaitGroup
+	for i := 0; i < rounds; i++ {
+		i := i
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			key := fmt.Sprintf("/concurrent/put-%03d", i)
+			if _, err := leader.Put(ctx, key, []byte("v"), 0); err == nil {
+				mu.Lock()
+				committed = append(committed, key)
+				mu.Unlock()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			_ = leader.Compact(ctx, leader.CurrentRevision())
+		}()
+	}
+	wg.Wait()
+
+	if len(committed) == 0 {
+		t.Fatal("no Puts succeeded — test inconclusive")
+	}
+	t.Logf("%d/%d Puts acknowledged", len(committed), rounds)
+
+	// Every acknowledged Put must appear on every node.
+	lastRev := leader.CurrentRevision()
+	for i, n := range nodes {
+		if err := n.WaitForRevision(ctx, lastRev); err != nil {
+			t.Fatalf("node-%d WaitForRevision: %v", i, err)
+		}
+		for _, key := range committed {
+			kv, err := n.Get(key)
+			if err != nil || kv == nil {
+				t.Errorf("node-%d Get(%q): err=%v kv=%v (key lost after concurrent compact)", i, key, err, kv)
+			}
+		}
+	}
+}
+
+// ── TestDeletedKeyDurability ──────────────────────────────────────────────────
+
+// TestDeletedKeyDurability verifies that keys deleted before compaction remain
+// absent on a fresh node that bootstraps entirely from object storage. This
+// tests the full write→delete→compact→S3-bootstrap pipeline.
+func TestDeletedKeyDurability(t *testing.T) {
+	store := object.NewMem()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const prefix = "/del-dur/"
+
+	// Phase 1: write, delete, compact.
+	var lastRev int64
+	func() {
+		n, err := strata.Open(strata.Config{
+			DataDir:            t.TempDir(),
+			ObjectStore:        store,
+			CheckpointInterval: 300 * time.Millisecond,
+			SegmentMaxAge:      100 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		defer n.Close()
+
+		for i := 0; i < 10; i++ {
+			if _, err := n.Put(ctx, fmt.Sprintf("%sk%d", prefix, i), []byte("v"), 0); err != nil {
+				t.Fatalf("Put k%d: %v", i, err)
+			}
+		}
+		// Delete the first five keys.
+		for i := 0; i < 5; i++ {
+			if _, err := n.Delete(ctx, fmt.Sprintf("%sk%d", prefix, i)); err != nil {
+				t.Fatalf("Delete k%d: %v", i, err)
+			}
+		}
+		rev := n.CurrentRevision()
+		if err := n.Compact(ctx, rev); err != nil {
+			t.Fatalf("Compact: %v", err)
+		}
+		lastRev = n.CurrentRevision()
+		// Allow checkpoint + WAL to land in object storage.
+		time.Sleep(800 * time.Millisecond)
+	}()
+
+	// Phase 2: fresh node bootstraps from S3 only.
+	fresh, err := strata.Open(strata.Config{
+		DataDir:     t.TempDir(),
+		ObjectStore: store,
+	})
+	if err != nil {
+		t.Fatalf("Open fresh node: %v", err)
+	}
+	defer fresh.Close()
+
+	if err := fresh.WaitForRevision(ctx, lastRev); err != nil {
+		t.Fatalf("WaitForRevision: %v", err)
+	}
+
+	// Deleted keys must be absent.
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("%sk%d", prefix, i)
+		kv, err := fresh.Get(key)
+		if err != nil {
+			t.Errorf("Get deleted %q: unexpected error: %v", key, err)
+			continue
+		}
+		if kv != nil {
+			t.Errorf("Get deleted %q: want nil, got value %q", key, kv.Value)
+		}
+	}
+	// Live keys must be present.
+	for i := 5; i < 10; i++ {
+		key := fmt.Sprintf("%sk%d", prefix, i)
+		kv, err := fresh.Get(key)
+		if err != nil || kv == nil {
+			t.Errorf("Get live %q: err=%v kv=%v", key, err, kv)
+		}
+	}
+}
+
+// ── TestBootstrapGCRace ───────────────────────────────────────────────────────
+
+// staleFirstManifestStore returns a saved stale manifest on the very first
+// Get("manifest/latest") call and the live value on all subsequent reads.
+// This deterministically reproduces the window where a fresh node reads the
+// manifest just before the leader writes a newer checkpoint and GCs the WAL
+// segments that would have been needed to replay from the stale revision.
+type staleFirstManifestStore struct {
+	object.Store
+	mu           sync.Mutex
+	stalePayload []byte
+	used         bool
+}
+
+func newStaleFirstManifestStore(inner object.Store, stalePayload []byte) *staleFirstManifestStore {
+	return &staleFirstManifestStore{Store: inner, stalePayload: stalePayload}
+}
+
+func (s *staleFirstManifestStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if key == checkpoint.ManifestKey {
+		s.mu.Lock()
+		first := !s.used
+		s.used = true
+		s.mu.Unlock()
+		if first {
+			return io.NopCloser(bytes.NewReader(s.stalePayload)), nil
+		}
+	}
+	return s.Store.Get(ctx, key)
+}
+
+// TestBootstrapGCRace is a regression test for the window between an initial
+// manifest read and replayRemote during Open(). Without the fix (re-reading
+// the manifest just before replayRemote), a fresh node that read an old
+// manifest would call replayRemote(afterRev=staleRev) and fail when the
+// leader had already GC'd the WAL segments between staleRev and the current
+// checkpoint revision.
+func TestBootstrapGCRace(t *testing.T) {
+	inner := object.NewMem()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const prefix = "/gc-race/"
+
+	// Phase 1: write 20 keys and let a checkpoint + GC cycle complete.
+	func() {
+		n, err := strata.Open(strata.Config{
+			DataDir:            t.TempDir(),
+			ObjectStore:        inner,
+			CheckpointInterval: 200 * time.Millisecond,
+			SegmentMaxAge:      50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("phase-1 Open: %v", err)
+		}
+		defer n.Close()
+
+		for i := 0; i < 20; i++ {
+			if _, err := n.Put(ctx, fmt.Sprintf("%sk%02d", prefix, i), []byte("v1"), 0); err != nil {
+				t.Fatalf("phase-1 Put k%d: %v", i, err)
+			}
+		}
+		time.Sleep(600 * time.Millisecond) // checkpoint + WAL segments land in S3
+	}()
+
+	// Snapshot the manifest now — this is the "stale" value a racing fresh node
+	// would see before the second checkpoint is written.
+	staleManifestBytes := func() []byte {
+		rc, err := inner.Get(ctx, checkpoint.ManifestKey)
+		if err != nil {
+			t.Fatalf("read stale manifest: %v", err)
+		}
+		defer rc.Close()
+		b, _ := io.ReadAll(rc)
+		return b
+	}()
+	var staleManifest checkpoint.Manifest
+	if err := json.Unmarshal(staleManifestBytes, &staleManifest); err != nil {
+		t.Fatalf("parse stale manifest: %v", err)
+	}
+	t.Logf("stale manifest: rev=%d", staleManifest.Revision)
+
+	// Phase 2: write 20 more keys → new checkpoint + GC removes segments that
+	// were covering the stale manifest's revision.
+	var lastRev int64
+	func() {
+		n, err := strata.Open(strata.Config{
+			DataDir:            t.TempDir(),
+			ObjectStore:        inner,
+			CheckpointInterval: 200 * time.Millisecond,
+			SegmentMaxAge:      50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("phase-2 Open: %v", err)
+		}
+		defer n.Close()
+
+		for i := 20; i < 40; i++ {
+			rev, err := n.Put(ctx, fmt.Sprintf("%sk%02d", prefix, i), []byte("v2"), 0)
+			if err != nil {
+				t.Fatalf("phase-2 Put k%d: %v", i, err)
+			}
+			lastRev = rev
+		}
+		time.Sleep(600 * time.Millisecond) // new checkpoint + GC complete
+	}()
+
+	walKeys, _ := inner.List(ctx, "wal/")
+	t.Logf("WAL segments remaining after phase-2 GC: %d", len(walKeys))
+
+	// Phase 3: wrap the store so the fresh node's first ReadManifest returns the
+	// stale snapshot. The fix re-reads the manifest before replayRemote and
+	// re-restores from the newer checkpoint, so the node must still recover all
+	// 40 keys despite the stale first read.
+	staleStore := newStaleFirstManifestStore(inner, staleManifestBytes)
+	fresh, err := strata.Open(strata.Config{
+		DataDir:     t.TempDir(),
+		ObjectStore: staleStore,
+	})
+	if err != nil {
+		t.Fatalf("Open fresh node: %v", err)
+	}
+	defer fresh.Close()
+
+	if err := fresh.WaitForRevision(ctx, lastRev); err != nil {
+		t.Fatalf("WaitForRevision: %v", err)
+	}
+	for i := 0; i < 40; i++ {
+		key := fmt.Sprintf("%sk%02d", prefix, i)
+		kv, err := fresh.Get(key)
+		if err != nil || kv == nil {
+			t.Errorf("Get %q: err=%v kv=%v (missing after GC-race bootstrap)", key, err, kv)
+		}
+	}
+}
+
+// ── TestLocalWALUploadedOnLeaderElection ─────────────────────────────────────
+
+// TestLocalWALUploadedOnLeaderElection verifies that when a node wins leader
+// election, any local WAL segment files that are not yet in S3 are uploaded
+// before the new leader WAL is opened.
+//
+// This exercises the uploadLocalWALSegments call added to becomeLeader.
+//
+// Scenario:
+//  1. A single-node writes data; S3 writes are fully blocked so the WAL segment
+//     stays local (Pebble has the data on disk, S3 is empty).
+//  2. The node is restarted in multi-node (peer) mode so that becomeLeader is
+//     called; the store is now unblocked.
+//  3. becomeLeader calls uploadLocalWALSegments, which uploads the local
+//     segment to S3.
+//  4. A fresh node (empty data dir) bootstraps from S3 and must see all data.
+func TestLocalWALUploadedOnLeaderElection(t *testing.T) {
+	mem := object.NewMem()
+	tracked := newTrackingStore(mem)
+	faulty := &faultyStore{inner: tracked}
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const prefix = "/leader-upload/"
+
+	// ── Phase 1: write data with S3 fully blocked ─────────────────────────────
+	faulty.break_()
+	func() {
+		node, err := strata.Open(strata.Config{
+			DataDir:            dir,
+			ObjectStore:        faulty,
+			CheckpointInterval: 24 * time.Hour,
+			SegmentMaxAge:      24 * time.Hour,
+			SegmentMaxSize:     500 << 20,
+		})
+		if err != nil {
+			t.Fatalf("phase-1 Open: %v", err)
+		}
+		for i := 0; i < 10; i++ {
+			if _, err := node.Put(ctx, fmt.Sprintf("%sk%d", prefix, i), []byte("v"), 0); err != nil {
+				t.Fatalf("phase-1 Put %d: %v", i, err)
+			}
+		}
+		node.Close()
+	}()
+
+	// Nothing in S3.
+	walKeys, _ := mem.List(ctx, "wal/")
+	if len(walKeys) != 0 {
+		t.Fatalf("expected no WAL in S3 after phase-1, got %v", walKeys)
+	}
+
+	// ── Phase 2: restart in multi-node mode with S3 repaired ──────────────────
+	// becomeLeader will call uploadLocalWALSegments before opening the new WAL.
+	faulty.repair()
+	peerAddr := freeAddrImpl(t)
+	node, err := strata.Open(strata.Config{
+		DataDir:            dir,
+		ObjectStore:        faulty,
+		NodeID:             "upload-test",
+		PeerListenAddr:     peerAddr,
+		AdvertisePeerAddr:  peerAddr,
+		CheckpointInterval: 24 * time.Hour, // no auto-checkpoint
+		SegmentMaxAge:      24 * time.Hour,
+		SegmentMaxSize:     500 << 20,
+	})
+	if err != nil {
+		t.Fatalf("phase-2 Open: %v", err)
+	}
+	// Wait for leader election so becomeLeader (and the upload) has run.
+	waitForLeaderNode(t, []*strata.Node{node}, 15*time.Second)
+	node.Close()
+
+	// The local WAL segment must now be present in S3.
+	walUploads := tracked.putCount("wal/")
+	if walUploads == 0 {
+		t.Error("expected local WAL segment to be uploaded when becoming leader, got 0 uploads")
+	}
+	t.Logf("WAL segments uploaded on leader election: %d", walUploads)
+
+	// ── Phase 3: fresh node must see all data ─────────────────────────────────
+	fresh, err := strata.Open(strata.Config{
+		DataDir:     t.TempDir(),
+		ObjectStore: faulty,
+	})
+	if err != nil {
+		t.Fatalf("phase-3 Open: %v", err)
+	}
+	defer fresh.Close()
+
+	kvs, err := fresh.List(prefix)
+	if err != nil {
+		t.Fatalf("phase-3 List: %v", err)
+	}
+	if len(kvs) != 10 {
+		t.Errorf("phase-3: want 10 keys, got %d", len(kvs))
+	}
+	for i := 0; i < 10; i++ {
+		kv, err := fresh.Get(fmt.Sprintf("%sk%d", prefix, i))
+		if err != nil || kv == nil {
+			t.Errorf("phase-3 Get k%d: err=%v kv=%v", i, err, kv)
+		}
 	}
 }

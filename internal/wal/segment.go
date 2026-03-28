@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 // Segment file format:
@@ -106,6 +108,22 @@ func (sw *SegmentWriter) FirstRev() int64 { return sw.firstRev }
 // Zero-padding ensures lexicographic order == chronological order.
 func SegmentName(term uint64, firstRev int64) string {
 	return fmt.Sprintf("%010d-%020d.wal", term, firstRev)
+}
+
+// ParseSegmentName parses the term and firstRev from a segment file name
+// of the form produced by SegmentName. Returns ok=false for unrecognised names.
+func ParseSegmentName(name string) (term uint64, firstRev int64, ok bool) {
+	name = strings.TrimSuffix(name, ".wal")
+	idx := strings.IndexByte(name, '-')
+	if idx < 0 {
+		return 0, 0, false
+	}
+	t, err1 := strconv.ParseUint(name[:idx], 10, 64)
+	r, err2 := strconv.ParseInt(name[idx+1:], 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return t, r, true
 }
 
 // ── SegmentReader ──────────────────────────────────────────────────────────────
