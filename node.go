@@ -122,6 +122,7 @@ type Node struct {
 	closeOnce              sync.Once
 	closed                 atomic.Bool
 	bgWg                   sync.WaitGroup // tracks long-running background goroutines (followLoop, checkpointLoop)
+	readWg                 sync.WaitGroup // tracks in-flight read operations; waited before db.Close()
 }
 
 func (n *Node) loadRole() nodeRole   { return nodeRole(n.role.Load()) }
@@ -734,6 +735,9 @@ func (n *Node) Close() error {
 		// DB. cancelBg has already been called above, so the loops will drain
 		// promptly; we just need to avoid closing DB under a concurrent Apply.
 		n.bgWg.Wait()
+		// Wait for any in-flight read operations (Get, List, WaitForRevision)
+		// that passed the n.closed check but haven't called into pebble yet.
+		n.readWg.Wait()
 		if werr := n.wal.Close(); werr != nil {
 			logrus.Errorf("strata: wal close: %v", werr)
 			err = werr
@@ -1126,6 +1130,11 @@ func (n *Node) Get(key string) (*KeyValue, error) {
 	if n.closed.Load() {
 		return nil, ErrClosed
 	}
+	n.readWg.Add(1)
+	defer n.readWg.Done()
+	if n.closed.Load() {
+		return nil, ErrClosed
+	}
 	sv, err := n.db.Get(key)
 	if err != nil || sv == nil {
 		return nil, err
@@ -1134,6 +1143,11 @@ func (n *Node) Get(key string) (*KeyValue, error) {
 }
 
 func (n *Node) List(prefix string) ([]*KeyValue, error) {
+	if n.closed.Load() {
+		return nil, ErrClosed
+	}
+	n.readWg.Add(1)
+	defer n.readWg.Done()
 	if n.closed.Load() {
 		return nil, ErrClosed
 	}
@@ -1155,6 +1169,11 @@ func (n *Node) Config() Config                     { return n.cfg }
 func (n *Node) IsLeader() bool                     { return n.loadRole() != roleFollower }
 
 func (n *Node) WaitForRevision(ctx context.Context, rev int64) error {
+	if n.closed.Load() {
+		return ErrClosed
+	}
+	n.readWg.Add(1)
+	defer n.readWg.Done()
 	if n.closed.Load() {
 		return ErrClosed
 	}
