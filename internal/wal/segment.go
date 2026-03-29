@@ -30,6 +30,7 @@ type SegmentWriter struct {
 	firstRev   int64
 	size       int64
 	entryCount int
+	sealed     bool // true once Seal() has been called successfully
 }
 
 // OpenSegmentWriter creates (or truncates) a new segment file and writes the header.
@@ -106,8 +107,16 @@ func (sw *SegmentWriter) Sync() error {
 func (sw *SegmentWriter) Close() error { return sw.f.Close() }
 
 // Seal closes the file. The segment is now safe to upload.
+// Calling Seal more than once is a no-op.
 func (sw *SegmentWriter) Seal() error {
-	return sw.f.Close()
+	if sw.sealed {
+		return nil
+	}
+	if err := sw.f.Close(); err != nil {
+		return err
+	}
+	sw.sealed = true
+	return nil
 }
 
 // Path returns the local file path.
