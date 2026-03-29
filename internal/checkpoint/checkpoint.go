@@ -260,3 +260,31 @@ func ListRemote(ctx context.Context, store object.Store) ([]string, error) {
 	sort.Strings(keys)
 	return keys, nil
 }
+
+// GCCheckpoints deletes old checkpoint archives from object storage, keeping
+// only the most recent `keep` checkpoints. Returns the number deleted.
+//
+// We keep at least 2 by default so that a node bootstrapping concurrently
+// (which reads manifest/latest then fetches the referenced key) cannot hit a
+// 404 if we race with it right after updating the manifest.
+func GCCheckpoints(ctx context.Context, store object.Store, keep int) (int, error) {
+	if keep < 1 {
+		keep = 1
+	}
+	keys, err := ListRemote(ctx, store)
+	if err != nil {
+		return 0, fmt.Errorf("checkpoint gc: list: %w", err)
+	}
+	if len(keys) <= keep {
+		return 0, nil
+	}
+	toDelete := keys[:len(keys)-keep]
+	var deleted int
+	for _, k := range toDelete {
+		if err := store.Delete(ctx, k); err != nil {
+			return deleted, fmt.Errorf("checkpoint gc: delete %q: %w", k, err)
+		}
+		deleted++
+	}
+	return deleted, nil
+}
