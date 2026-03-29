@@ -3,9 +3,11 @@ package etcd_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/makhov/strata"
@@ -218,6 +220,115 @@ func TestWatchFromRevision(t *testing.T) {
 		case <-ctx.Done():
 			t.Fatalf("timeout: got %d/2 events", received)
 		}
+	}
+}
+
+// TestWatchKubeLikeCompactionRecovery emulates kube-apiserver startup behavior:
+// stale watch revisions can be compacted, then a relist picks a fresh revision
+// and watching from freshRV+1 succeeds.
+func TestWatchKubeLikeCompactionRecovery(t *testing.T) {
+	node, cli := newWatchNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Use multiple resource-like prefixes to mirror apiserver starting many cachers.
+	prefixes := []string{
+		"/registry/apps/deployments/",
+		"/registry/apps/controllerrevisions/",
+		"/registry/rbac.clusterroles/",
+		"/registry/storageclasses/",
+		"/registry/resourceclaims/",
+	}
+
+	// Seed initial objects then compact at current revision.
+	for i, p := range prefixes {
+		if _, err := node.Put(ctx, fmt.Sprintf("%sseed-%d", p, i), []byte("v1"), 0); err != nil {
+			t.Fatalf("seed Put(%q): %v", p, err)
+		}
+	}
+	compactRev := node.CurrentRevision()
+	if err := node.Compact(ctx, compactRev); err != nil {
+		t.Fatalf("Compact(%d): %v", compactRev, err)
+	}
+
+	// Emulate an apiserver resuming from stale list RV: it watches from rv+1.
+	// Choose staleListRV=compactRev-1 so watch starts at compactRev and gets compacted.
+	staleListRV := compactRev - 1
+	if staleListRV < 1 {
+		t.Fatalf("unexpected staleListRV=%d", staleListRV)
+	}
+	startRev := staleListRV + 1
+
+	for _, p := range prefixes {
+		wctx, wcancel := context.WithCancel(ctx)
+		wch := cli.Watch(wctx, p, clientv3.WithPrefix(), clientv3.WithRev(startRev))
+		compacted := false
+		for !compacted {
+			select {
+			case wr, ok := <-wch:
+				if !ok {
+					t.Fatalf("watch %q closed before compacted signal", p)
+				}
+				if err := wr.Err(); err != nil {
+					if err == rpctypes.ErrCompacted || strings.Contains(err.Error(), "required revision has been compacted") {
+						compacted = true
+						continue
+					}
+					t.Fatalf("watch %q unexpected error: %v", p, err)
+				}
+				if wr.Canceled {
+					if wr.CompactRevision == 0 {
+						t.Fatalf("watch %q canceled without compact revision", p)
+					}
+					compacted = true
+				}
+			case <-ctx.Done():
+				t.Fatalf("timeout waiting compacted watch on %q", p)
+			}
+		}
+		wcancel()
+	}
+
+	// Kube relists, then watches from listRV+1.
+	for i, p := range prefixes {
+		getResp, err := cli.Get(ctx, p, clientv3.WithPrefix())
+		if err != nil {
+			t.Fatalf("Get(%q): %v", p, err)
+		}
+		freshListRV := getResp.Header.Revision
+
+		wctx, wcancel := context.WithCancel(ctx)
+		wch := cli.Watch(wctx, p, clientv3.WithPrefix(), clientv3.WithRev(freshListRV+1))
+
+		key := fmt.Sprintf("%safter-relist-%d", p, i)
+		if _, err := node.Put(ctx, key, []byte("v2"), 0); err != nil {
+			t.Fatalf("post-relist Put(%q): %v", key, err)
+		}
+
+		received := false
+		for !received {
+			select {
+			case wr, ok := <-wch:
+				if !ok {
+					t.Fatalf("watch %q closed unexpectedly after relist", p)
+				}
+				if err := wr.Err(); err != nil {
+					t.Fatalf("watch %q unexpected error after relist: %v", p, err)
+				}
+				if wr.Canceled {
+					t.Fatalf("watch %q unexpectedly canceled after relist (compactRev=%d)", p, wr.CompactRevision)
+				}
+				for _, ev := range wr.Events {
+					if string(ev.Kv.Key) == key {
+						received = true
+						break
+					}
+				}
+			case <-ctx.Done():
+				t.Fatalf("timeout waiting post-relist event on %q", p)
+			}
+		}
+		wcancel()
 	}
 }
 

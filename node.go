@@ -1084,13 +1084,25 @@ func (n *Node) await(ctx context.Context, req *writeReq, op string, start time.T
 // them to Pebble as a batch, and signals each caller's done channel.
 func (n *Node) commitLoop(ctx context.Context) {
 	defer func() {
-		// Fence the node so no new writes can enter the queue after we drain it.
-		// Acquire n.mu so that any writer currently between the closed check and
-		// the writeC send (still holding the lock) finishes before we mark closed.
-		n.mu.Lock()
+		// Fence the node first so new writers fail fast.
 		n.closed.Store(true)
+
+		// Drain requests immediately to free queue slots. This unblocks writers
+		// that might be stuck on n.writeC <- req while holding n.mu.
+	drain:
+		for {
+			select {
+			case req := <-n.writeC:
+				req.done <- ErrClosed
+			default:
+				break drain
+			}
+		}
+
+		// Wait for any writer currently in the critical section (between closed
+		// check and queue send) to finish, then perform a final drain pass.
+		n.mu.Lock()
 		n.mu.Unlock()
-		// Drain any requests already buffered in writeC.
 		for {
 			select {
 			case req := <-n.writeC:
@@ -1269,11 +1281,19 @@ func (n *Node) WaitForRevision(ctx context.Context, rev int64) error {
 	return nil
 }
 
+// Watch streams prefix-matching events using etcd revision semantics:
+// startRev=0 means "from now"; startRev=N means replay from revision N (inclusive).
 func (n *Node) Watch(ctx context.Context, prefix string, startRev int64) (<-chan Event, error) {
-	if startRev > 0 && startRev < n.db.CompactRevision()-1 {
+	if startRev > 0 && startRev <= n.db.CompactRevision() {
 		return nil, ErrCompacted
 	}
-	sch, err := n.db.Watch(ctx, prefix, startRev)
+	// internal/store.Watch uses last-seen revision semantics (start at rev+1),
+	// so adapt etcd-style startRev here.
+	storeStartRev := startRev - 1
+	if startRev == 0 {
+		storeStartRev = n.db.CurrentRevision()
+	}
+	sch, err := n.db.Watch(ctx, prefix, storeStartRev)
 	if err != nil {
 		return nil, err
 	}

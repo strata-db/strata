@@ -313,7 +313,7 @@ func TestNodeWatchPrevKV(t *testing.T) {
 	c := ctx(t)
 	n.Put(c, "k", []byte("old"), 0)
 
-	ch, _ := n.Watch(c, "k", n.CurrentRevision())
+	ch, _ := n.Watch(c, "k", n.CurrentRevision()+1)
 
 	go func() { n.Put(c, "k", []byte("new"), 0) }()
 
@@ -362,23 +362,20 @@ func TestWatchCompactedRevisionReturnsError(t *testing.T) {
 		t.Fatalf("Compact: %v", err)
 	}
 
-	// startRev=1 delivers from rev 2, which is inside the compacted range → ErrCompacted.
+	// startRev=1 is inside the compacted range → ErrCompacted.
 	_, err := n.Watch(c, "k", 1)
 	if !errors.Is(err, strata.ErrCompacted) {
 		t.Errorf("Watch from deeply compacted rev: want ErrCompacted, got %v", err)
 	}
 
-	// startRev=2 delivers from rev 3, which is intact (the compact boundary) → OK.
-	// This is the "just re-listed, now watching from compactRev" case that must not loop.
-	ch, err := n.Watch(c, "k", 2)
-	if err != nil {
-		t.Errorf("Watch from compact watermark (startRev=compactRev-1): unexpected error %v", err)
-	} else {
-		_ = ch
+	// startRev=3 is the compact boundary itself; etcd semantics require ErrCompacted.
+	_, err = n.Watch(c, "k", 3)
+	if !errors.Is(err, strata.ErrCompacted) {
+		t.Errorf("Watch from compact watermark (startRev=compactRev): want ErrCompacted, got %v", err)
 	}
 
-	// startRev=3 (above compact boundary) is always fine.
-	ch, err = n.Watch(c, "k", 3)
+	// startRev=4 (above compact boundary) is always fine.
+	ch, err := n.Watch(c, "k", 4)
 	if err != nil {
 		t.Errorf("Watch above compact boundary: unexpected error %v", err)
 	} else {

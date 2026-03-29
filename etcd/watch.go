@@ -3,6 +3,7 @@ package etcd
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -28,8 +29,21 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	}()
 
 	type entry struct{ cancel context.CancelFunc }
+	var watchesMu sync.Mutex
 	watches := map[int64]entry{}
 	var nextID int64 = 1
+	removeWatch := func(id int64) (context.CancelFunc, bool) {
+		watchesMu.Lock()
+		w, ok := watches[id]
+		if ok {
+			delete(watches, id)
+		}
+		watchesMu.Unlock()
+		if !ok {
+			return nil, false
+		}
+		return w.cancel, true
+	}
 
 	for {
 		req, err := stream.Recv()
@@ -44,7 +58,9 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 			nextID++
 
 			wctx, cancel := context.WithCancel(ctx)
+			watchesMu.Lock()
 			watches[id] = entry{cancel}
+			watchesMu.Unlock()
 
 			// Confirm the watch was created.
 			select {
@@ -54,16 +70,13 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 				goto done
 			}
 
-			// node.Watch uses "last seen revision" semantics (delivers from startRev+1).
-			// The etcd protocol uses "first desired revision" semantics (0 = current, N = from N inclusive).
-			storeStartRev := s.node.CurrentRevision()
-			if cr.StartRevision > 0 {
-				storeStartRev = cr.StartRevision - 1
-			}
-
 			go func(watchID int64, startRev int64) {
 				events, err := s.node.Watch(wctx, string(cr.Key), startRev)
 				if errors.Is(err, strata.ErrCompacted) {
+					// Remove the watch first, but do not cancel wctx before sending
+					// the compacted response: that races the select below and can
+					// drop the required canceled notification.
+					_, _ = removeWatch(watchID)
 					select {
 					case sendCh <- &etcdserverpb.WatchResponse{
 						Header:          s.header(),
@@ -72,7 +85,7 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 						CancelReason:    "mvcc: required revision has been compacted",
 						CompactRevision: s.node.CompactRevision(),
 					}:
-					case <-wctx.Done():
+					case <-ctx.Done():
 					}
 					return
 				}
@@ -91,13 +104,12 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 						return
 					}
 				}
-			}(id, storeStartRev)
+			}(id, cr.StartRevision)
 
 		case *etcdserverpb.WatchRequest_CancelRequest:
 			id := v.CancelRequest.WatchId
-			if w, ok := watches[id]; ok {
-				w.cancel()
-				delete(watches, id)
+			if cancel, ok := removeWatch(id); ok {
+				cancel()
 				select {
 				case sendCh <- &etcdserverpb.WatchResponse{Header: s.header(), WatchId: id, Canceled: true}:
 				case <-ctx.Done():
@@ -108,7 +120,14 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	}
 
 done:
+	watchesMu.Lock()
+	all := make([]entry, 0, len(watches))
 	for _, w := range watches {
+		all = append(all, w)
+	}
+	watches = map[int64]entry{}
+	watchesMu.Unlock()
+	for _, w := range all {
 		w.cancel()
 	}
 	return nil

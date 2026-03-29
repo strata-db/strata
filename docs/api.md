@@ -67,8 +67,9 @@ Count(prefix string) (int64, error)
 ## Watch
 
 ```go
-// Watch streams events for keys matching prefix starting from startRev (inclusive).
-// startRev=0 means start from the current revision (no history replay).
+// Watch streams events for keys matching prefix using etcd semantics:
+// startRev=0 means start from the current revision (no history replay),
+// startRev=N means replay events from revision N (inclusive).
 // The returned channel is closed when ctx is cancelled or the node shuts down.
 Watch(ctx context.Context, prefix string, startRev int64) (<-chan Event, error)
 ```
