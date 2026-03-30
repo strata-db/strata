@@ -158,6 +158,54 @@ func TestCheckpointKey(t *testing.T) {
 	}
 }
 
+// ── GCCheckpoints ─────────────────────────────────────────────────────────────
+
+func TestGCCheckpoints(t *testing.T) {
+	store := object.NewMem()
+	ctx := context.Background()
+
+	// Seed 5 checkpoint objects directly.
+	for i := 1; i <= 5; i++ {
+		key := checkpoint.CheckpointKey(1, int64(i))
+		if err := store.Put(ctx, key, strings.NewReader("data")); err != nil {
+			t.Fatalf("seed put: %v", err)
+		}
+	}
+
+	// Keep the 2 most recent; should delete 3.
+	deleted, err := checkpoint.GCCheckpoints(ctx, store, 2)
+	if err != nil {
+		t.Fatalf("GCCheckpoints: %v", err)
+	}
+	if deleted != 3 {
+		t.Errorf("deleted: want 3, got %d", deleted)
+	}
+
+	// Remaining keys should only be the last 2.
+	remaining, _ := checkpoint.ListRemote(ctx, store)
+	if len(remaining) != 2 {
+		t.Errorf("remaining: want 2, got %d: %v", len(remaining), remaining)
+	}
+	if remaining[0] != checkpoint.CheckpointKey(1, 4) || remaining[1] != checkpoint.CheckpointKey(1, 5) {
+		t.Errorf("unexpected remaining keys: %v", remaining)
+	}
+}
+
+func TestGCCheckpointsNoop(t *testing.T) {
+	store := object.NewMem()
+	ctx := context.Background()
+
+	// Fewer objects than `keep` — nothing should be deleted.
+	store.Put(ctx, checkpoint.CheckpointKey(1, 1), strings.NewReader("data"))
+	deleted, err := checkpoint.GCCheckpoints(ctx, store, 2)
+	if err != nil {
+		t.Fatalf("GCCheckpoints: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted: want 0, got %d", deleted)
+	}
+}
+
 // ── Write / Restore ───────────────────────────────────────────────────────────
 
 func TestWriteRestore(t *testing.T) {

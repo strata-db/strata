@@ -1424,6 +1424,16 @@ func (n *Node) maybeCheckpoint(ctx context.Context) {
 		metrics.WALGCTotal.Add(float64(deleted))
 		logrus.Infof("strata: wal gc: deleted %d segments (covered by checkpoint rev=%d)", deleted, rev)
 	}
+
+	// GC old checkpoint archives from S3, keeping the 2 most recent so that
+	// any in-flight bootstrap that read manifest/latest just before we
+	// overwrote it can still fetch the previous checkpoint.
+	cpDeleted, cpGCErr := checkpoint.GCCheckpoints(gcCtx, n.cfg.ObjectStore, 2)
+	if cpGCErr != nil {
+		logrus.Warnf("strata: checkpoint gc: %v", cpGCErr)
+	} else if cpDeleted > 0 {
+		logrus.Infof("strata: checkpoint gc: deleted %d old checkpoint(s)", cpDeleted)
+	}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
