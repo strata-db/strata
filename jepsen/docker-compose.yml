@@ -1,0 +1,78 @@
+version: "3.8"
+
+# Shared node definition — 5 DB nodes running strata.
+x-node: &node
+  build:
+    context: ..                        # strata repo root (Go source lives here)
+    dockerfile: jepsen/node/Dockerfile
+  cap_add: [NET_ADMIN, NET_RAW, SYS_PTRACE]
+  networks: [jepsen]
+  environment:
+    # AWS SDK credential chain picks these up automatically.
+    AWS_ACCESS_KEY_ID: "jepsen"
+    AWS_SECRET_ACCESS_KEY: "jepsen123"
+    AWS_DEFAULT_REGION: "us-east-1"   # MinIO ignores this but the SDK requires it
+  ulimits:
+    nofile: { soft: 65536, hard: 65536 }
+
+services:
+  # ── Control node ──────────────────────────────────────────────────────────
+  control:
+    build:
+      context: control
+      dockerfile: Dockerfile
+    hostname: control
+    networks: [jepsen]
+    volumes:
+      - ./:/jepsen              # mount jepsen project files (hot-reload)
+      - lein-cache:/root/.lein  # cache downloaded deps between runs
+    working_dir: /jepsen
+    depends_on: [n1, n2, n3, n4, n5]
+    stdin_open: true
+    tty: true
+    # Default: drop into a shell. Override with:
+    #   docker compose run control lein run -- --nodes n1,n2,n3,n4,n5 ...
+    command: ["/bin/bash"]
+
+  # ── DB nodes ──────────────────────────────────────────────────────────────
+  n1: { <<: *node, hostname: n1 }
+  n2: { <<: *node, hostname: n2 }
+  n3: { <<: *node, hostname: n3 }
+  n4: { <<: *node, hostname: n4 }
+  n5: { <<: *node, hostname: n5 }
+
+  # ── MinIO (object store, outside partition boundary) ──────────────────────
+  minio:
+    image: minio/minio:latest
+    hostname: minio
+    networks: [jepsen]
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: jepsen
+      MINIO_ROOT_PASSWORD: jepsen123
+    volumes: [minio-data:/data]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Creates the 'jepsen' bucket on first boot.
+  minio-init:
+    image: minio/mc:latest
+    networks: [jepsen]
+    depends_on:
+      minio: { condition: service_healthy }
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 jepsen jepsen123 &&
+        mc mb --ignore-existing local/jepsen
+      "
+
+networks:
+  jepsen:
+    driver: bridge
+
+volumes:
+  minio-data:
+  lein-cache:

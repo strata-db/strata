@@ -1,0 +1,13 @@
+# Generated SSH keys — never commit these.
+control/id_ed25519
+control/id_ed25519.pub
+node/authorized_keys
+
+# Leiningen / Clojure build artifacts.
+target/
+.lein-*
+.nrepl-port
+.cpcache/
+
+# Jepsen test output.
+store/

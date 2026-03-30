@@ -6,6 +6,58 @@ on:
   workflow_dispatch: # allow manual trigger
 
 jobs:
+  jepsen:
+    name: Jepsen (${{ matrix.nemesis }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false   # run all nemeses even if one fails
+      matrix:
+        nemesis: [partition-halves, kill, partition-minio]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SSH keys
+        run: make -C jepsen keys
+
+      - name: Build images
+        run: docker compose -f jepsen/docker-compose.yml build
+        # Cache Go module downloads across builds.
+        env:
+          DOCKER_BUILDKIT: "1"
+
+      - name: Start infrastructure
+        run: |
+          docker compose -f jepsen/docker-compose.yml up -d \
+            minio minio-init n1 n2 n3 n4 n5
+          # Wait for minio-init to finish creating the bucket.
+          docker compose -f jepsen/docker-compose.yml \
+            wait minio-init || true
+
+      - name: Run Jepsen (${{ matrix.nemesis }}, 120 s)
+        run: |
+          docker compose -f jepsen/docker-compose.yml run --rm control \
+            lein run -- test \
+              --nodes        n1,n2,n3,n4,n5 \
+              --username     root \
+              --ssh-private-key /root/.ssh/id_ed25519 \
+              --workload     register \
+              --nemesis      ${{ matrix.nemesis }} \
+              --time-limit   120
+
+      - name: Upload Jepsen store
+        if: always()   # capture results even on test failure
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-store-${{ matrix.nemesis }}-${{ github.sha }}
+          path: jepsen/store/
+          retention-days: 30
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f jepsen/docker-compose.yml down -v
+
   stress:
     name: Stress (30m)
     runs-on: ubuntu-latest
