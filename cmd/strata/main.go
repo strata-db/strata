@@ -40,6 +40,7 @@ func rootCmd() *cobra.Command {
 		segmentMaxSizeMB      int64
 		segmentMaxAgeSec      int
 		checkpointIntervalMin int
+		checkpointEntries     int64
 		logLevel              string
 		// multi-node
 		nodeID                 string
@@ -70,6 +71,7 @@ func rootCmd() *cobra.Command {
 				SegmentMaxSize:      segmentMaxSizeMB << 20,
 				SegmentMaxAge:       time.Duration(segmentMaxAgeSec) * time.Second,
 				CheckpointInterval:  time.Duration(checkpointIntervalMin) * time.Minute,
+				CheckpointEntries:   checkpointEntries,
 				NodeID:              nodeID,
 				PeerListenAddr:      peerListenAddr,
 				AdvertisePeerAddr:   advertisePeerAddr,
@@ -137,6 +139,7 @@ func rootCmd() *cobra.Command {
 	cmd.Flags().Int64Var(&segmentMaxSizeMB, "segment-max-size-mb", 50, "WAL segment rotation size threshold in MiB")
 	cmd.Flags().IntVar(&segmentMaxAgeSec, "segment-max-age-sec", 10, "WAL segment rotation age threshold in seconds")
 	cmd.Flags().IntVar(&checkpointIntervalMin, "checkpoint-interval-min", 15, "checkpoint interval in minutes (requires --s3-bucket)")
+	cmd.Flags().Int64Var(&checkpointEntries, "checkpoint-entries", 0, "triggers a checkpoint after this many WAL entries regardless of time. 0 means disabled (requires --s3-bucket)")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level (trace/debug/info/warn/error)")
 	// multi-node
 	cmd.Flags().StringVar(&nodeID, "node-id", "", "stable unique node identifier (default: hostname)")

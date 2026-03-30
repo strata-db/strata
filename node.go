@@ -129,6 +129,7 @@ type Node struct {
 	leaderCli atomic.Pointer[peer.Client]
 
 	entriesSinceCheckpoint int64
+	checkpointTriggerC     chan struct{} // non-nil when CheckpointEntries > 0; signals entry-count-based checkpoint
 	cancelBg               context.CancelFunc
 	closeOnce              sync.Once
 	closed                 atomic.Bool
@@ -328,6 +329,9 @@ func Open(cfg Config) (*Node, error) {
 		nextRev:  db.CurrentRevision(),
 		pending:  make(map[string]pendingKV),
 		writeC:   make(chan *writeReq, 1024),
+	}
+	if cfg.CheckpointEntries > 0 {
+		n.checkpointTriggerC = make(chan struct{}, 1)
 	}
 
 	w.Start(bgCtx)
@@ -1099,7 +1103,13 @@ func (n *Node) await(ctx context.Context, req *writeReq, op string, start time.T
 	metrics.WritesTotal.WithLabelValues(op).Inc()
 	metrics.WriteDuration.WithLabelValues(op).Observe(time.Since(start).Seconds())
 	metrics.CurrentRevision.Set(float64(rev))
-	atomic.AddInt64(&n.entriesSinceCheckpoint, 1)
+	count := atomic.AddInt64(&n.entriesSinceCheckpoint, 1)
+	if n.checkpointTriggerC != nil && count >= n.cfg.CheckpointEntries {
+		select {
+		case n.checkpointTriggerC <- struct{}{}:
+		default: // already a pending trigger; don't block
+		}
+	}
 	return rev, nil
 }
 
@@ -1391,6 +1401,8 @@ func (n *Node) checkpointLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
+			n.maybeCheckpoint(ctx)
+		case <-n.checkpointTriggerC:
 			n.maybeCheckpoint(ctx)
 		case <-ctx.Done():
 			return
