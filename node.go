@@ -631,19 +631,32 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 	// optional PUT). Returns false and steps down if the lock has been superseded.
 	// When touch is true and still leader, also writes LastSeenNano to the lock
 	// so disconnected followers see a fresh liveness signal and back off TakeOver.
+	//
+	// NOTE: fenceMu is released explicitly (not via defer) so that grpcSrv.Stop()
+	// can be called outside the lock.  grpc.Server.Stop waits for in-flight
+	// handlers to finish; those handlers (Put/Create/…) acquire fenceMu.RLock()
+	// themselves, so calling Stop() while holding the write lock would deadlock.
 	fencedCheck := func(reason string, touch bool) bool {
 		n.fenceMu.Lock()
-		defer n.fenceMu.Unlock()
 		rCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		rec, err := lock.Read(rCtx)
 		cancel()
 		if err != nil {
+			n.fenceMu.Unlock()
 			logrus.Warnf("strata: leader watch (%s): read lock: %v", reason, err)
 			return true // transient S3 error; keep running
 		}
 		if rec == nil || rec.Term != term || rec.NodeID != n.cfg.NodeID {
 			logrus.Errorf("strata: leader watch (%s): lock superseded (current: %+v) — stepping down", reason, rec)
 			n.cancelBg()
+			n.fenceMu.Unlock()
+			// Stop the peer gRPC server so followers immediately lose their
+			// streams and detect the leadership change.  Without this, followers
+			// keep forwarding ForwardGetRevision to this zombie leader and receive
+			// a stale revision, causing linearizability violations.
+			if grpcSrv := n.peerGRPC; grpcSrv != nil {
+				grpcSrv.Stop()
+			}
 			return false
 		}
 		if touch && n.peerSrv != nil {
@@ -653,6 +666,7 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 			}
 			tCancel()
 		}
+		n.fenceMu.Unlock()
 		return true
 	}
 
