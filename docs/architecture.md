@@ -117,10 +117,10 @@ If the store does not implement the `ConditionalStore` interface (optional; see 
 4. Otherwise: read the lock ETag, then `PUT` with `If-Match: <etag>`. Only the candidate that read the same ETag wins; all others get a precondition failure and re-read to find the new leader.
 
 **Stepdown:**
-- On every follower disconnect the leader immediately fences all writes (`fenceMu` write-lock), reads S3 to confirm it still holds the lock, and writes a **liveness touch** (`LastSeenNano = now()`) so disconnected followers see a fresh record and back off from TakeOver.
-- Polling (fence + check + touch every `FollowerRetryInterval` = 2 s) continues until at least one follower reconnects; once followers are present, polling pauses — liveness is signalled implicitly by the live stream.
+- On every follower disconnect the leader immediately fences all writes (`fenceMu` write-lock), reads the S3 lock **with its ETag**, and — if still the owner — writes a **liveness touch** (`LastSeenNano = now()`) using `If-Match: <etag>` (conditional PUT). This closes the Read→Touch race: if a follower won a TakeOver between the leader's Read and Touch, the conditional PUT fails with `ErrPreconditionFailed` and the leader steps down immediately, without a second round-trip.
+- Polling (fence + conditional-check + conditional-touch every `FollowerRetryInterval` = 2 s) continues until at least one follower reconnects; once followers are present, polling pauses — liveness is signalled implicitly by the live stream.
 - As a backstop, the leader re-reads the lock on the `LeaderWatchInterval` (default 5 min) periodic ticker even when no disconnect has occurred.
-- If the lock no longer points to this node at any check, it steps down.
+- If the lock no longer points to this node at any check (or the conditional touch is rejected), it steps down.
 
 **S3 request budget during a disconnect event:**  
 Each poll tick costs 1 GET + 1 PUT (touch). With a `FollowerRetryInterval` of 2 s, that is at most 1 GET + 1 PUT per 2 s while a follower is disconnected. Polling stops as soon as any follower reconnects. Outside of disconnect events (and the periodic ticker) there are zero additional S3 requests on the write path.
@@ -132,7 +132,7 @@ There is no heartbeat, no TTL, and no ZooKeeper-style session. The only S3 write
 Strata is an **AP** system (Available + Partition-tolerant, not Consistent under partitions):
 
 - **No network partition**: reads are linearizable (followers use the ReadIndex pattern — they sync to the leader's revision before serving). Writes are always routed to the leader.
-- **Under network partition**: when a follower is fully isolated (can't reach leader or other followers), it will eventually TakeOver once `LastSeenNano` goes stale. Write fencing ensures the old leader detects the new term within one poll interval (≤ 2 s) and steps down. The split-brain window is bounded to ≤ 2 s in the common case, and zero when the leader still has other followers (follower backs off via liveness touch).
+- **Under network partition**: when a follower is fully isolated (can't reach leader or other followers), it will eventually TakeOver once `LastSeenNano` goes stale. The old leader detects supersession either via its next conditional liveness touch (which fails with `ErrPreconditionFailed` the instant a new leader writes the lock) or within one poll interval (≤ 2 s). **The split-brain window is effectively zero**: the conditional touch means A cannot refresh its liveness after B wins — A's next touch attempt is rejected and triggers immediate stepdown. The window is zero when the leader still has other followers (follower backs off via liveness touch).
 
 **Known limitation:** a fully isolated old leader (partitioned from both all followers and S3) will continue to accept writes until it can reach S3. Making Strata CP under partitions would require quorum writes (majority acknowledgment before commit) — a Raft/Paxos-level redesign. The current design deliberately prioritises simplicity and availability.
 

@@ -49,7 +49,7 @@ type ConditionalStore interface {
 }
 ```
 
-Both `S3Store` and `Mem` implement `ConditionalStore`. If your custom store does not, election falls back to an unconditional write + read-back (slightly less race-safe under concurrent startup).
+Both `S3Store` and `Mem` implement `ConditionalStore`. If your custom store does not, election falls back to an unconditional write + read-back (slightly less race-safe under concurrent startup), and liveness touches fall back to unconditional PUT (the Read→Touch split-brain protection is not available).
 
 ---
 
