@@ -1027,6 +1027,17 @@ func (n *Node) Close() error {
 	n.closeOnce.Do(func() {
 		n.closed.Store(true)
 
+		// Snapshot peer handles under the mutex before using them. becomeLeader
+		// and becomeFollower write these fields under n.mu, so reads in Close
+		// must also be guarded to avoid a data race.
+		n.mu.Lock()
+		role := n.loadRole()
+		peerCli := n.peerCli
+		peerSrv := n.peerSrv
+		peerGRPC := n.peerGRPC
+		peerLis := n.peerLis
+		n.mu.Unlock()
+
 		// Graceful goodbye signals — sent before cancelling context so the RPCs
 		// can complete on a still-running connection.
 		//
@@ -1035,16 +1046,16 @@ func (n *Node) Close() error {
 		//
 		// Leader: tell all followers to start election immediately so they don't
 		// wait FollowerMaxRetries × FollowerRetryInterval before taking over.
-		switch n.loadRole() {
+		switch role {
 		case roleFollower:
-			if cli := n.peerCli; cli != nil {
+			if peerCli != nil {
 				gCtx, gCancel := context.WithTimeout(context.Background(), 3*time.Second)
-				cli.GoodBye(gCtx)
+				peerCli.GoodBye(gCtx)
 				gCancel()
 			}
 		case roleLeader:
-			if n.peerSrv != nil {
-				n.peerSrv.BroadcastShutdown()
+			if peerSrv != nil {
+				peerSrv.BroadcastShutdown()
 			}
 		}
 
@@ -1052,10 +1063,10 @@ func (n *Node) Close() error {
 		if cli := n.leaderCli.Load(); cli != nil {
 			cli.Close()
 		}
-		if n.peerGRPC != nil {
-			n.peerGRPC.Stop() // terminates all active streams immediately
-		} else if n.peerLis != nil {
-			n.peerLis.Close()
+		if peerGRPC != nil {
+			peerGRPC.Stop() // terminates all active streams immediately
+		} else if peerLis != nil {
+			peerLis.Close()
 		}
 		// Signal the store's closed channel now, before waiting on readWg.
 		// This unblocks any goroutines blocked in store.WaitForRevision (which
