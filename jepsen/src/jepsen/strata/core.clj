@@ -132,7 +132,7 @@
        :generator (gen/phases
                     ;; Main test phase: interleave client ops with nemesis faults.
                     (->> (:gen workload)
-                         (gen/stagger 0.3)    ; ~3 ops/s x 120 s ≈ 360 ops — Knossos WGL OOMs above ~500 history events
+                         (gen/stagger 1.0)    ; ~1 op/s × 120 s ≈ 120 ops — low concurrency keeps Knossos WGL from OOMing during partitions
                          (gen/nemesis (:gen nem))
                          (gen/time-limit time-limit))
                     ;; Recovery phase: let the cluster heal, then do a final read.
