@@ -31,6 +31,23 @@ const (
 	ReadConsistencySerializable ReadConsistency = "serializable"
 )
 
+// FollowerWaitMode controls how many follower ACKs a leader waits for before
+// applying a batch locally and acknowledging the write to the client.
+type FollowerWaitMode string
+
+const (
+	// FollowerWaitNone skips follower ACK waiting entirely.
+	FollowerWaitNone FollowerWaitMode = "none"
+
+	// FollowerWaitQuorum waits for a majority of the cluster. Since the leader
+	// already has the entry durably in its WAL, this means waiting for enough
+	// followers to reach quorum with the leader included.
+	FollowerWaitQuorum FollowerWaitMode = "quorum"
+
+	// FollowerWaitAll waits for every connected follower present when the batch
+	// starts waiting.
+	FollowerWaitAll FollowerWaitMode = "all"
+)
 
 // Config holds all configuration for a Node.
 type Config struct {
@@ -128,6 +145,11 @@ type Config struct {
 	// Default: 5.
 	FollowerMaxRetries int
 
+	// FollowerWaitMode controls how many follower ACKs the leader waits for
+	// before applying a batch to Pebble and acknowledging it to the client.
+	// Default: FollowerWaitQuorum.
+	FollowerWaitMode FollowerWaitMode
+
 	// PeerBufferSize is the number of WAL entries the leader buffers for
 	// follower catch-up. Default: 10 000.
 	PeerBufferSize int
@@ -179,6 +201,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.FollowerMaxRetries == 0 {
 		c.FollowerMaxRetries = 5
+	}
+	if c.FollowerWaitMode == "" {
+		c.FollowerWaitMode = FollowerWaitQuorum
 	}
 	if c.PeerBufferSize == 0 {
 		c.PeerBufferSize = 10_000

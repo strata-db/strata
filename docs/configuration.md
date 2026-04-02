@@ -19,6 +19,7 @@
 | `AdvertisePeerAddr` | `string` | `PeerListenAddr` | Address that followers use to reach this node. Set this when the listen address is not directly routable (container, NAT). |
 | `LeaderWatchInterval` | `time.Duration` | 5 min | How often the leader re-reads the S3 lock to detect supersession by a new leader. |
 | `FollowerMaxRetries` | `int` | 5 | Consecutive stream failures before a follower attempts election takeover. |
+| `FollowerWaitMode` | `FollowerWaitMode` | `quorum` | How many follower ACKs the leader waits for before acknowledging a write: `none`, `quorum`, or `all`. |
 | `PeerBufferSize` | `int` | 10 000 | WAL entries buffered in memory for follower catch-up. |
 | `PeerServerTLS` | `credentials.TransportCredentials` | `nil` | mTLS credentials for the peer gRPC server (leader side). |
 | `PeerClientTLS` | `credentials.TransportCredentials` | `nil` | mTLS credentials for the peer gRPC client (follower side). |
@@ -80,6 +81,7 @@ strata run [flags]
 | `--advertise-peer` | `--peer-listen` | Advertised peer address (use when behind NAT) |
 | `--leader-watch-interval-sec` | `300` | Leader lock re-read interval (seconds) |
 | `--follower-max-retries` | `5` | Stream failures before a follower attempts takeover |
+| `--follower-wait-mode` | `quorum` | Follower ACK wait policy before leader commit: `none`, `quorum`, or `all` |
 | `--peer-tls-ca` | — | CA certificate for peer mTLS (PEM file) |
 | `--peer-tls-cert` | — | Node certificate for peer mTLS (PEM file) |
 | `--peer-tls-key` | — | Node private key for peer mTLS (PEM file) |

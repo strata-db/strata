@@ -14,6 +14,14 @@ import (
 	"github.com/makhov/strata/internal/wal"
 )
 
+type WaitMode string
+
+const (
+	WaitNone   WaitMode = "none"
+	WaitQuorum WaitMode = "quorum"
+	WaitAll    WaitMode = "all"
+)
+
 // Server is the leader-side WAL streaming + write-forwarding server.
 //
 // It maintains:
@@ -28,11 +36,11 @@ import (
 //
 // Thread safety: Broadcast and Follow both hold mu.
 type Server struct {
-	mu             sync.Mutex
-	buf            *entryBuffer
-	followers      map[string]chan *wal.Entry
+	mu              sync.Mutex
+	buf             *entryBuffer
+	followers       map[string]chan *wal.Entry
 	followerAckRevs map[string]int64 // last ACK'd revision per follower
-	forwardHandler ForwardHandler
+	forwardHandler  ForwardHandler
 
 	// ackNotify is a buffered-1 channel. A non-blocking send is made whenever
 	// any follower ACKs an entry or disconnects, waking WaitForFollowers.
@@ -132,9 +140,9 @@ func (s *Server) notifyACK() {
 	}
 }
 
-// WaitForFollowers blocks until all followers that were connected at call time
-// have ACK'd a revision >= rev, or until they disconnect. New followers that
-// connect after this call are not included in the required set.
+// WaitForFollowers blocks until enough followers connected at call time have
+// ACK'd a revision >= rev according to mode, or until all remaining candidates
+// disconnect. New followers that connect after this call are not included.
 //
 // Returns ctx.Err() if the context is cancelled before quorum is reached.
 // Returns nil immediately if no followers are connected.
@@ -142,25 +150,36 @@ func (s *Server) notifyACK() {
 // This is called by the commitLoop after WAL.AppendBatch and before db.Apply
 // to implement quorum commit: the leader only commits to Pebble once a majority
 // has the entry durably in their WAL.
-func (s *Server) WaitForFollowers(ctx context.Context, rev int64) error {
+func (s *Server) WaitForFollowers(ctx context.Context, rev int64, mode WaitMode) error {
 	// Snapshot which followers must ACK this revision.
 	s.mu.Lock()
 	if len(s.followers) == 0 {
 		s.mu.Unlock()
 		return nil
 	}
+	target := requiredFollowerACKs(len(s.followers), mode)
 	required := make(map[string]struct{}, len(s.followers))
 	for id := range s.followers {
 		required[id] = struct{}{}
 	}
 	s.mu.Unlock()
+	if target == 0 {
+		return nil
+	}
 
 	for {
 		s.mu.Lock()
+		acked := 0
 		pending := 0
 		for id := range required {
 			if _, connected := s.followers[id]; connected {
-				if s.followerAckRevs[id] < rev {
+				if s.followerAckRevs[id] >= rev {
+					acked++
+					if acked >= target {
+						s.mu.Unlock()
+						return nil
+					}
+				} else {
 					pending++
 				}
 			}
@@ -168,7 +187,7 @@ func (s *Server) WaitForFollowers(ctx context.Context, rev int64) error {
 		}
 		s.mu.Unlock()
 
-		if pending == 0 {
+		if acked >= target || pending == 0 {
 			return nil
 		}
 		select {
@@ -177,6 +196,20 @@ func (s *Server) WaitForFollowers(ctx context.Context, rev int64) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+}
+
+func requiredFollowerACKs(connected int, mode WaitMode) int {
+	switch mode {
+	case WaitNone:
+		return 0
+	case WaitAll:
+		return connected
+	case WaitQuorum, "":
+		// Majority of the current cluster, counting the leader as already durable.
+		return (connected + 1) / 2
+	default:
+		return (connected + 1) / 2
 	}
 }
 
@@ -199,7 +232,6 @@ func (s *Server) MinFollowerAppliedRev() int64 {
 	}
 	return min
 }
-
 
 func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error {
 	// Atomically snapshot the buffer and register the live channel.

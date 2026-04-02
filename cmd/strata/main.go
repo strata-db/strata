@@ -63,6 +63,7 @@ func runCmd() *cobra.Command {
 		advertisePeerAddr      string
 		leaderWatchIntervalSec int
 		followerMaxRetries     int
+		followerWaitMode       string
 		// peer mTLS
 		peerTLSCA   string
 		peerTLSCert string
@@ -96,6 +97,11 @@ func runCmd() *cobra.Command {
 			if walSyncUpload != "" && walSyncUpload != "true" && walSyncUpload != "false" {
 				return fmt.Errorf("--wal-sync-upload must be \"true\" or \"false\", got %q", walSyncUpload)
 			}
+			switch strata.FollowerWaitMode(followerWaitMode) {
+			case "", strata.FollowerWaitNone, strata.FollowerWaitQuorum, strata.FollowerWaitAll:
+			default:
+				return fmt.Errorf("--follower-wait-mode must be one of \"none\", \"quorum\", or \"all\", got %q", followerWaitMode)
+			}
 
 			cfg := strata.Config{
 				DataDir:             dataDir,
@@ -109,6 +115,7 @@ func runCmd() *cobra.Command {
 				AdvertisePeerAddr:   advertisePeerAddr,
 				LeaderWatchInterval: time.Duration(leaderWatchIntervalSec) * time.Second,
 				FollowerMaxRetries:  followerMaxRetries,
+				FollowerWaitMode:    strata.FollowerWaitMode(followerWaitMode),
 				MetricsAddr:         metricsAddr,
 			}
 
@@ -235,6 +242,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().StringVar(&advertisePeerAddr, "advertise-peer", "", "address followers use to reach this node's peer stream (default: --peer-listen)")
 	cmd.Flags().IntVar(&leaderWatchIntervalSec, "leader-watch-interval-sec", 300, "how often (seconds) the leader reads the lock to detect supersession")
 	cmd.Flags().IntVar(&followerMaxRetries, "follower-max-retries", 5, "consecutive stream failures before a follower attempts a leader takeover")
+	cmd.Flags().StringVar(&followerWaitMode, "follower-wait-mode", "quorum", "leader wait policy for follower ACKs before commit: none, quorum, or all")
 	// peer mTLS
 	cmd.Flags().StringVar(&peerTLSCA, "peer-tls-ca", "", "CA certificate file for peer mTLS (PEM)")
 	cmd.Flags().StringVar(&peerTLSCert, "peer-tls-cert", "", "node certificate file for peer mTLS (PEM)")

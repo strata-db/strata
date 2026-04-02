@@ -1645,9 +1645,10 @@ func (n *Node) commitLoop(ctx context.Context) {
 			}
 		}
 
-		// Quorum commit: wait for all connected followers to ACK the batch
-		// before committing to Pebble. This guarantees that a committed entry
-		// exists on at least two nodes' WALs before the caller sees success.
+		// Wait for follower ACKs according to the configured policy before
+		// committing to Pebble. In the default quorum mode this guarantees
+		// the entry exists on a majority of nodes' WALs before the caller sees
+		// success.
 		//
 		// Use the commit loop's own context (node lifetime), NOT batchCtx.
 		// batchCtx is cancelled immediately after AppendBatch to release the
@@ -1659,7 +1660,7 @@ func (n *Node) commitLoop(ctx context.Context) {
 		// and will be replayed by followers when they reconnect.
 		if err == nil && n.peerSrv != nil {
 			maxRev := batch[len(batch)-1].entry.Revision
-			_ = n.peerSrv.WaitForFollowers(ctx, maxRev)
+			_ = n.peerSrv.WaitForFollowers(ctx, maxRev, peer.WaitMode(n.cfg.FollowerWaitMode))
 		}
 
 		// Apply all entries to Pebble as one batch (in order).
