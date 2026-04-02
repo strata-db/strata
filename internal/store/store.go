@@ -145,6 +145,10 @@ func (s *Store) Close() error {
 // Pebble exposes the underlying *pebble.DB for checkpoint creation.
 func (s *Store) Pebble() *pebble.DB { return s.db }
 
+// Flush forces Pebble to flush any buffered writes so a subsequent checkpoint
+// captures the latest applied state even when live commits use pebble.NoSync.
+func (s *Store) Flush() error { return s.db.Flush() }
+
 // CurrentRevision returns the latest applied revision.
 func (s *Store) CurrentRevision() int64 { return atomic.LoadInt64(&s.currentRev) }
 

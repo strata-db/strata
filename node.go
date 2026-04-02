@@ -1885,6 +1885,10 @@ func (n *Node) forceCheckpoint(ctx context.Context) {
 		logrus.Errorf("strata: startup checkpoint seal WAL: %v", err)
 		return
 	}
+	if err := n.db.Flush(); err != nil {
+		logrus.Errorf("strata: startup checkpoint flush pebble: %v", err)
+		return
+	}
 	if err := checkpoint.Write(ctx, n.db.Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.cfg.AncestorStore); err != nil {
 		logrus.Errorf("strata: startup checkpoint rev=%d: %v", rev, err)
 		return
@@ -1904,6 +1908,10 @@ func (n *Node) maybeCheckpoint(ctx context.Context) {
 	}
 	if err := n.wal.SealAndFlush(rev + 1); err != nil {
 		logrus.Errorf("strata: checkpoint seal WAL: %v", err)
+		return
+	}
+	if err := n.db.Flush(); err != nil {
+		logrus.Errorf("strata: checkpoint flush pebble: %v", err)
 		return
 	}
 	if err := checkpoint.Write(ctx, n.db.Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.cfg.AncestorStore); err != nil {
