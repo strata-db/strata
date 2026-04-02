@@ -175,6 +175,10 @@ func (s *Server) WaitForFollowers(ctx context.Context, rev int64, mode WaitMode)
 			if _, connected := s.followers[id]; connected {
 				if s.followerAckRevs[id] >= rev {
 					acked++
+					if acked >= target {
+						s.mu.Unlock()
+						return nil
+					}
 				} else {
 					pending++
 				}
