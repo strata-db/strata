@@ -81,6 +81,11 @@ strata run [flags]
 | `--peer-tls-ca` | — | CA certificate for peer mTLS (PEM file) |
 | `--peer-tls-cert` | — | Node certificate for peer mTLS (PEM file) |
 | `--peer-tls-key` | — | Node private key for peer mTLS (PEM file) |
+| `--client-tls-cert` | — | Server certificate for client-facing TLS on the etcd port (PEM file) |
+| `--client-tls-key` | — | Server private key for client-facing TLS (PEM file) |
+| `--client-tls-ca` | — | CA certificate for client mTLS; omit for server-only TLS (PEM file) |
+| `--auth-enabled` | `false` | Enable etcd-compatible authentication and RBAC |
+| `--token-ttl` | `300` | Bearer token lifetime in seconds |
 | `--metrics-addr` | — | HTTP address for metrics and health endpoints |
 | `--branch-source-bucket` | — | S3 bucket of the source database (branch nodes only) |
 | `--branch-source-prefix` | — | S3 prefix of the source database (branch nodes only) |

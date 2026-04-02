@@ -119,6 +119,202 @@ node, err := strata.Open(strata.Config{
 
 ---
 
+## Client TLS
+
+By default the etcd gRPC port (3379) is plaintext. Enable TLS to encrypt traffic between clients and the server.
+
+### Server-only TLS (encryption, no client cert required)
+
+```bash
+strata run \
+  ... \
+  --client-tls-cert /etc/strata/tls/server.crt \
+  --client-tls-key  /etc/strata/tls/server.key
+```
+
+Clients connect with TLS but are not required to present a certificate. Use this when clients are etcd-compatible tools or libraries that support TLS but not mTLS.
+
+```bash
+etcdctl --endpoints=https://localhost:3379 \
+        --cacert /etc/strata/tls/ca.crt \
+        put /hello world
+```
+
+### Mutual TLS (mTLS, client cert required)
+
+Add `--client-tls-ca` to require clients to present a certificate signed by the given CA:
+
+```bash
+strata run \
+  ... \
+  --client-tls-cert /etc/strata/tls/server.crt \
+  --client-tls-key  /etc/strata/tls/server.key \
+  --client-tls-ca   /etc/strata/tls/ca.crt
+```
+
+```bash
+etcdctl --endpoints=https://localhost:3379 \
+        --cacert  /etc/strata/tls/ca.crt  \
+        --cert    /etc/strata/tls/client.crt \
+        --key     /etc/strata/tls/client.key \
+        put /hello world
+```
+
+Client TLS and peer mTLS are independent — each uses its own cert/key/CA and can be enabled or disabled separately.
+
+---
+
+## Authentication and RBAC
+
+Strata implements the etcd v3 Auth API: username/password authentication with bearer tokens, and role-based access control scoped to key prefixes. Auth state (users, roles, enabled flag) is stored in Pebble and flows through the WAL, so it is replicated to followers and included in S3 checkpoints.
+
+Enable auth with `--auth-enabled`:
+
+```bash
+strata run \
+  ... \
+  --auth-enabled \
+  --token-ttl 300   # bearer token lifetime in seconds (default: 300)
+```
+
+### Initial setup
+
+Auth cannot be enabled unless a `root` user exists. Bootstrap with `etcdctl`:
+
+```bash
+ETCDCTL_API=3 etcdctl --endpoints=localhost:3379 user add root
+# Enter password at prompt
+
+ETCDCTL_API=3 etcdctl --endpoints=localhost:3379 auth enable
+```
+
+Once enabled, all KV and Watch requests require a valid bearer token. The `root` user has unconditional access to all keys via the built-in `root` role.
+
+> **Note:** The `root` user and `root` role cannot be deleted while auth is enabled.
+
+### Authenticating
+
+```bash
+ETCDCTL_API=3 etcdctl --endpoints=localhost:3379 \
+  --user root:yourpassword \
+  put /hello world
+```
+
+The etcd client library handles token acquisition and refresh automatically when `--user` is provided. Tokens expire after `--token-ttl` seconds; the client re-authenticates transparently.
+
+### Managing users
+
+```bash
+# Create a user
+etcdctl --endpoints=localhost:3379 --user root:pass user add alice
+
+# List users
+etcdctl --endpoints=localhost:3379 --user root:pass user list
+
+# Delete a user
+etcdctl --endpoints=localhost:3379 --user root:pass user delete alice
+
+# Change password
+etcdctl --endpoints=localhost:3379 --user root:pass user passwd alice
+```
+
+### Managing roles
+
+```bash
+# Create a role
+etcdctl --endpoints=localhost:3379 --user root:pass role add reader
+
+# Grant read access to a key prefix
+etcdctl --endpoints=localhost:3379 --user root:pass \
+  role grant-permission reader read /data/ --prefix
+
+# Grant write access to a specific key
+etcdctl --endpoints=localhost:3379 --user root:pass \
+  role grant-permission reader write /config/app
+
+# Grant read+write access to a prefix
+etcdctl --endpoints=localhost:3379 --user root:pass \
+  role grant-permission writer readwrite /app/ --prefix
+
+# Revoke a permission
+etcdctl --endpoints=localhost:3379 --user root:pass \
+  role revoke-permission reader /data/ --prefix
+
+# List roles
+etcdctl --endpoints=localhost:3379 --user root:pass role list
+
+# Inspect a role's permissions
+etcdctl --endpoints=localhost:3379 --user root:pass role get reader
+
+# Delete a role
+etcdctl --endpoints=localhost:3379 --user root:pass role delete reader
+```
+
+### Assigning roles to users
+
+```bash
+# Grant a role
+etcdctl --endpoints=localhost:3379 --user root:pass \
+  user grant-role alice reader
+
+# Revoke a role
+etcdctl --endpoints=localhost:3379 --user root:pass \
+  user revoke-role alice reader
+
+# List a user's roles
+etcdctl --endpoints=localhost:3379 --user root:pass user get alice
+```
+
+### RBAC rule evaluation
+
+A request is permitted when the authenticated user has at least one role whose permissions cover the requested key and operation type:
+
+| Operation | Required permission |
+|---|---|
+| `Range` (Get / List) | `read` |
+| `Put` | `write` |
+| `DeleteRange` | `write` |
+| `Txn` | `write` |
+| `Watch` | `read` |
+
+A permission entry covers a key when:
+- **Exact key** (`--prefix` omitted): the key matches exactly.
+- **Prefix range** (`--prefix`): the key starts with the permission's key prefix (computed as `rangeEnd = prefix[:-1] + chr(ord(prefix[-1])+1)`).
+- **Open-ended range** (`rangeEnd = "\x00"`): all keys ≥ the permission key.
+
+The `root` role always passes all checks regardless of the key.
+
+### Auth namespace protection
+
+Keys under the `\x00auth/` prefix are reserved for internal auth storage. Access to these keys via the KV service is blocked for all users, including `root`. Attempting to read or write them returns `PermissionDenied`.
+
+### Disabling auth
+
+```bash
+etcdctl --endpoints=localhost:3379 --user root:pass auth disable
+```
+
+Or restart the node without `--auth-enabled`. Auth state (users, roles) is preserved in Pebble — re-enabling auth later restores the same configuration.
+
+### Full example: read-only service account
+
+```bash
+# 1. Create the role with read access to /config/
+etcdctl --user root:pass role add config-reader
+etcdctl --user root:pass role grant-permission config-reader read /config/ --prefix
+
+# 2. Create the user and assign the role
+etcdctl --user root:pass user add svc-account
+etcdctl --user root:pass user grant-role svc-account config-reader
+
+# 3. The service account can read /config/ but not write
+etcdctl --user svc-account:pass get /config/timeout   # OK
+etcdctl --user svc-account:pass put /config/timeout 60s  # PermissionDenied
+etcdctl --user svc-account:pass get /secrets/key         # PermissionDenied
+```
+
+---
+
 ## Observability
 
 ```bash

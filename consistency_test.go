@@ -79,6 +79,7 @@ func openClusterNode(t testing.TB, store object.Store, id string) *strata.Node {
 		AdvertisePeerAddr:  peerAddr,
 		FollowerMaxRetries: 3,
 		PeerBufferSize:     1000,
+		WALSyncUpload:      &[]bool{false}[0], // no-sync for more stress
 		CheckpointInterval: 400 * time.Millisecond,
 		SegmentMaxAge:      150 * time.Millisecond,
 	})

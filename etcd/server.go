@@ -1,7 +1,7 @@
 // Package etcd exposes a strata Node as an etcd v3 gRPC server.
 //
-// Register wires the KV, Watch, Lease, Cluster, and Maintenance services onto
-// a *grpc.Server. Any etcd v3 client — etcdctl, go.etcd.io/etcd/client/v3,
+// Register wires the KV, Watch, Lease, Cluster, Maintenance, and Auth services
+// onto a *grpc.Server. Any etcd v3 client — etcdctl, go.etcd.io/etcd/client/v3,
 // Kubernetes — can talk to it without modification.
 //
 // Not all etcd RPCs are meaningful for a single-node embedded store; unimplemented
@@ -21,16 +21,35 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/makhov/strata"
+	"github.com/makhov/strata/etcd/auth"
 )
 
 // Server implements the etcd v3 gRPC protocol on top of a strata Node.
 type Server struct {
-	node *strata.Node
+	node      *strata.Node
+	authStore *auth.Store
+	tokens    *auth.TokenStore
 }
 
-// New returns a Server backed by node.
-func New(node *strata.Node) *Server {
-	return &Server{node: node}
+// New returns a Server backed by node. When authStore and tokens are non-nil,
+// the Auth gRPC service is registered and RBAC is enforced on all KV/Watch
+// calls.
+func New(node *strata.Node, authStore *auth.Store, tokens *auth.TokenStore) *Server {
+	return &Server{node: node, authStore: authStore, tokens: tokens}
+}
+
+// NewServerOptions returns the gRPC server options required for auth
+// enforcement (interceptors). Pass the returned options to grpc.NewServer.
+// When authStore is nil the returned options are empty (no-op).
+func NewServerOptions(authStore *auth.Store, tokens *auth.TokenStore) []grpc.ServerOption {
+	if authStore == nil {
+		return nil
+	}
+	unary, stream := auth.Interceptors(authStore, tokens)
+	return []grpc.ServerOption{
+		grpc.UnaryInterceptor(unary),
+		grpc.StreamInterceptor(stream),
+	}
 }
 
 // Register wires the etcd services onto srv.
@@ -40,6 +59,12 @@ func (s *Server) Register(srv *grpc.Server) {
 	etcdserverpb.RegisterLeaseServer(srv, s)
 	etcdserverpb.RegisterClusterServer(srv, s)
 	etcdserverpb.RegisterMaintenanceServer(srv, s)
+
+	if s.authStore != nil {
+		etcdserverpb.RegisterAuthServer(srv, auth.NewService(s.authStore, s.tokens))
+	} else {
+		etcdserverpb.RegisterAuthServer(srv, &etcdserverpb.UnimplementedAuthServer{})
+	}
 
 	hs := health.NewServer()
 	hs.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)

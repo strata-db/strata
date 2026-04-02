@@ -19,7 +19,7 @@ func newServer(t *testing.T) *strataetcd.Server {
 		t.Fatalf("strata.Open: %v", err)
 	}
 	t.Cleanup(func() { node.Close() })
-	return strataetcd.New(node)
+	return strataetcd.New(node, nil, nil)
 }
 
 func put(t *testing.T, srv *strataetcd.Server, key, val string) int64 {

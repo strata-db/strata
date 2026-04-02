@@ -21,6 +21,7 @@ import (
 
 	"github.com/makhov/strata"
 	strataetcd "github.com/makhov/strata/etcd"
+	"github.com/makhov/strata/etcd/auth"
 	"github.com/makhov/strata/internal/checkpoint"
 	"github.com/makhov/strata/pkg/object"
 )
@@ -61,10 +62,17 @@ func runCmd() *cobra.Command {
 		advertisePeerAddr      string
 		leaderWatchIntervalSec int
 		followerMaxRetries     int
-		// mTLS
+		// peer mTLS
 		peerTLSCA   string
 		peerTLSCert string
 		peerTLSKey  string
+		// client TLS
+		clientTLSCert string
+		clientTLSKey  string
+		clientTLSCA   string
+		// auth
+		authEnabled bool
+		tokenTTLSec int
 		// observability
 		metricsAddr string
 		// branch node
@@ -143,14 +151,46 @@ func runCmd() *cobra.Command {
 			defer node.Close()
 			logrus.Infof("node started (rev=%d)", node.CurrentRevision())
 
+			// ── Auth setup ───────────────────────────────────────────────────
+			var (
+				authStore *auth.Store
+				tokens    *auth.TokenStore
+			)
+			if authEnabled {
+				authStore, err = auth.NewStore(node)
+				if err != nil {
+					return fmt.Errorf("init auth store: %w", err)
+				}
+				tokens = auth.NewTokenStore(cmd.Context(), time.Duration(tokenTTLSec)*time.Second)
+				logrus.Infof("auth enabled (token TTL %ds)", tokenTTLSec)
+			}
+
+			// ── gRPC server ──────────────────────────────────────────────────
+			var grpcOpts []grpc.ServerOption
+
+			if clientTLSCert != "" {
+				creds, err := buildClientTLS(clientTLSCert, clientTLSKey, clientTLSCA)
+				if err != nil {
+					return fmt.Errorf("client TLS: %w", err)
+				}
+				grpcOpts = append(grpcOpts, grpc.Creds(creds))
+				if clientTLSCA != "" {
+					logrus.Info("client mTLS enabled")
+				} else {
+					logrus.Info("client TLS enabled (server-only)")
+				}
+			}
+
+			grpcOpts = append(grpcOpts, strataetcd.NewServerOptions(authStore, tokens)...)
+
 			lis, err := net.Listen("tcp", listenAddr)
 			if err != nil {
 				return fmt.Errorf("listen %s: %w", listenAddr, err)
 			}
 			logrus.Infof("listening on %s", listenAddr)
 
-			srv := grpc.NewServer()
-			strataetcd.New(node).Register(srv)
+			srv := grpc.NewServer(grpcOpts...)
+			strataetcd.New(node, authStore, tokens).Register(srv)
 
 			go func() {
 				if err := srv.Serve(lis); err != nil {
@@ -184,10 +224,17 @@ func runCmd() *cobra.Command {
 	cmd.Flags().StringVar(&advertisePeerAddr, "advertise-peer", "", "address followers use to reach this node's peer stream (default: --peer-listen)")
 	cmd.Flags().IntVar(&leaderWatchIntervalSec, "leader-watch-interval-sec", 300, "how often (seconds) the leader reads the lock to detect supersession")
 	cmd.Flags().IntVar(&followerMaxRetries, "follower-max-retries", 5, "consecutive stream failures before a follower attempts a leader takeover")
-	// mTLS
+	// peer mTLS
 	cmd.Flags().StringVar(&peerTLSCA, "peer-tls-ca", "", "CA certificate file for peer mTLS (PEM)")
 	cmd.Flags().StringVar(&peerTLSCert, "peer-tls-cert", "", "node certificate file for peer mTLS (PEM)")
 	cmd.Flags().StringVar(&peerTLSKey, "peer-tls-key", "", "node private key file for peer mTLS (PEM)")
+	// client TLS
+	cmd.Flags().StringVar(&clientTLSCert, "client-tls-cert", "", "server certificate file for client-facing TLS (PEM)")
+	cmd.Flags().StringVar(&clientTLSKey, "client-tls-key", "", "server private key file for client-facing TLS (PEM)")
+	cmd.Flags().StringVar(&clientTLSCA, "client-tls-ca", "", "CA certificate for client mTLS (PEM); omit for server-only TLS")
+	// auth
+	cmd.Flags().BoolVar(&authEnabled, "auth-enabled", false, "enable etcd-compatible authentication and RBAC")
+	cmd.Flags().IntVar(&tokenTTLSec, "token-ttl", 300, "bearer token TTL in seconds")
 	// observability
 	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "", "HTTP address for /metrics, /healthz, /readyz (e.g. 0.0.0.0:9090)")
 	// branch node
@@ -282,6 +329,34 @@ func branchUnforkCmd() *cobra.Command {
 	cmd.MarkFlagRequired("source-bucket")
 	cmd.MarkFlagRequired("branch-id")
 	return cmd
+}
+
+// buildClientTLS constructs TLS credentials for the client-facing gRPC server.
+// cert and key are required. ca is optional: when provided, mutual TLS is
+// enforced (client cert required); when absent, only the server presents a
+// certificate (encryption-only).
+func buildClientTLS(cert, key, ca string) (credentials.TransportCredentials, error) {
+	tlsCert, err := tls.LoadX509KeyPair(cert, key)
+	if err != nil {
+		return nil, fmt.Errorf("load cert/key: %w", err)
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if ca != "" {
+		caPEM, err := os.ReadFile(ca)
+		if err != nil {
+			return nil, fmt.Errorf("read CA: %w", err)
+		}
+		caPool := x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("parse CA cert")
+		}
+		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+		tlsCfg.ClientCAs = caPool
+	}
+	return credentials.NewTLS(tlsCfg), nil
 }
 
 // buildPeerTLS constructs mTLS credentials for both the leader's gRPC server

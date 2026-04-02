@@ -27,7 +27,7 @@ func startEtcdServer(tb testing.TB, node *strata.Node) string {
 		tb.Fatalf("listen: %v", err)
 	}
 	srv := grpc.NewServer()
-	strataetcd.New(node).Register(srv)
+	strataetcd.New(node, nil, nil).Register(srv)
 	go srv.Serve(lis)
 	tb.Cleanup(srv.GracefulStop)
 	return lis.Addr().String()
