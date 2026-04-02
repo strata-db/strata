@@ -359,6 +359,8 @@ func runMixed(val string, n, clients int) ([]int64, int, time.Duration) {
 	}
 
 	// reader goroutines — random keys from the pre-seeded set
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	var rngMu sync.Mutex
 	wg.Add(readers)
 	for w := 0; w < readers; w++ {
 		w := w
@@ -373,7 +375,9 @@ func runMixed(val string, n, clients int) ([]int64, int, time.Duration) {
 			}
 			defer cli.Close()
 			for j := 0; j < opsEach; j++ {
+				rngMu.Lock()
 				i := rng.Int63n(int64(n))
+				rngMu.Unlock()
 				t0 := time.Now()
 				if _, err := cli.Get(ctx, makeKey(i)); err != nil {
 					errCount.Add(1)
