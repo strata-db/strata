@@ -1878,18 +1878,28 @@ func (n *Node) checkpointLoop(ctx context.Context) {
 // forceCheckpoint writes a checkpoint unconditionally (bypassing the
 // entriesSinceCheckpoint guard). Used on startup to capture local state.
 func (n *Node) forceCheckpoint(ctx context.Context) {
+	n.fenceMu.Lock()
 	rev := n.db.CurrentRevision()
 	if rev == 0 {
+		n.fenceMu.Unlock()
 		return
 	}
 	if err := n.wal.SealAndFlush(rev + 1); err != nil {
+		n.fenceMu.Unlock()
 		logrus.Errorf("strata: startup checkpoint seal WAL: %v", err)
 		return
 	}
+	if err := n.db.Flush(); err != nil {
+		n.fenceMu.Unlock()
+		logrus.Errorf("strata: startup checkpoint flush pebble: %v", err)
+		return
+	}
 	if err := checkpoint.Write(ctx, n.db.Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.cfg.AncestorStore); err != nil {
+		n.fenceMu.Unlock()
 		logrus.Errorf("strata: startup checkpoint rev=%d: %v", rev, err)
 		return
 	}
+	n.fenceMu.Unlock()
 	atomic.StoreInt64(&n.entriesSinceCheckpoint, 0)
 	metrics.CheckpointsTotal.Inc()
 	logrus.Infof("strata: startup checkpoint written (rev=%d)", rev)
@@ -1899,18 +1909,28 @@ func (n *Node) maybeCheckpoint(ctx context.Context) {
 	if atomic.LoadInt64(&n.entriesSinceCheckpoint) == 0 {
 		return
 	}
+	n.fenceMu.Lock()
 	rev := n.db.CurrentRevision()
 	if rev == 0 {
+		n.fenceMu.Unlock()
 		return
 	}
 	if err := n.wal.SealAndFlush(rev + 1); err != nil {
+		n.fenceMu.Unlock()
 		logrus.Errorf("strata: checkpoint seal WAL: %v", err)
 		return
 	}
+	if err := n.db.Flush(); err != nil {
+		n.fenceMu.Unlock()
+		logrus.Errorf("strata: checkpoint flush pebble: %v", err)
+		return
+	}
 	if err := checkpoint.Write(ctx, n.db.Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.cfg.AncestorStore); err != nil {
+		n.fenceMu.Unlock()
 		logrus.Errorf("strata: write checkpoint rev=%d: %v", rev, err)
 		return
 	}
+	n.fenceMu.Unlock()
 	atomic.StoreInt64(&n.entriesSinceCheckpoint, 0)
 	metrics.CheckpointsTotal.Inc()
 	logrus.Infof("strata: checkpoint written (rev=%d)", rev)
