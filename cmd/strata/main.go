@@ -26,6 +26,144 @@ import (
 	"github.com/makhov/strata/pkg/object"
 )
 
+func startupLogFields(
+	dataDir string,
+	listenAddr string,
+	s3Bucket string,
+	s3Prefix string,
+	s3Endpoint string,
+	readConsistency string,
+	logLevel string,
+	nodeID string,
+	walSyncUpload string,
+	peerListenAddr string,
+	advertisePeerAddr string,
+	leaderWatchIntervalSec int,
+	followerMaxRetries int,
+	clientTLSCert string,
+	clientTLSCA string,
+	peerTLSCert string,
+	peerTLSCA string,
+	authEnabled bool,
+	tokenTTLSec int,
+	metricsAddr string,
+	branchSourceBucket string,
+	branchSourcePrefix string,
+	branchSourceEndpoint string,
+	branchCheckpoint string,
+) logrus.Fields {
+	fields := logrus.Fields{
+		"data_dir":                  dataDir,
+		"listen_addr":               listenAddr,
+		"log_level":                 logLevel,
+		"mode":                      runMode(s3Bucket, peerListenAddr, branchSourceBucket),
+		"node_id":                   resolvedNodeID(nodeID),
+		"read_consistency":          readConsistency,
+		"s3_bucket":                 valueOrDisabled(s3Bucket),
+		"s3_prefix":                 valueOrNone(s3Prefix),
+		"s3_endpoint":               valueOrDefault(s3Endpoint, "aws-default"),
+		"wal_sync_upload":           resolvedWALSyncUpload(walSyncUpload, peerListenAddr),
+		"peer_listen_addr":          valueOrDisabled(peerListenAddr),
+		"advertise_peer_addr":       resolvedAdvertisePeerAddr(peerListenAddr, advertisePeerAddr),
+		"leader_watch_interval_sec": leaderWatchIntervalSec,
+		"follower_max_retries":      followerMaxRetries,
+		"client_tls":                tlsMode(clientTLSCert, clientTLSCA),
+		"peer_tls":                  tlsMode(peerTLSCert, peerTLSCA),
+		"auth":                      authMode(authEnabled, tokenTTLSec),
+		"metrics_addr":              valueOrDisabled(metricsAddr),
+	}
+
+	if branchSourceBucket != "" {
+		fields["branch_source_bucket"] = branchSourceBucket
+		fields["branch_source_prefix"] = valueOrNone(branchSourcePrefix)
+		fields["branch_source_endpoint"] = valueOrDefault(branchSourceEndpoint, "aws-default")
+		fields["branch_checkpoint"] = branchCheckpoint
+	}
+
+	return fields
+}
+
+func runMode(s3Bucket, peerListenAddr, branchSourceBucket string) string {
+	switch {
+	case branchSourceBucket != "":
+		return "branch"
+	case peerListenAddr != "":
+		return "multi-node"
+	case s3Bucket != "":
+		return "single-node+s3"
+	default:
+		return "single-node"
+	}
+}
+
+func resolvedNodeID(nodeID string) string {
+	if nodeID != "" {
+		return nodeID
+	}
+	if h, err := os.Hostname(); err == nil {
+		return h + " (auto)"
+	}
+	return "node-0 (auto fallback)"
+}
+
+func resolvedWALSyncUpload(walSyncUpload, peerListenAddr string) string {
+	if peerListenAddr != "" {
+		return "async (multi-node quorum)"
+	}
+	if walSyncUpload == "" || walSyncUpload == "true" {
+		return "true"
+	}
+	return "false"
+}
+
+func resolvedAdvertisePeerAddr(peerListenAddr, advertisePeerAddr string) string {
+	if peerListenAddr == "" {
+		return "disabled"
+	}
+	if advertisePeerAddr != "" {
+		return advertisePeerAddr
+	}
+	return peerListenAddr + " (default)"
+}
+
+func tlsMode(certPath, caPath string) string {
+	if certPath == "" {
+		return "disabled"
+	}
+	if caPath != "" {
+		return "mutual"
+	}
+	return "server-only"
+}
+
+func authMode(enabled bool, tokenTTLSec int) string {
+	if !enabled {
+		return "disabled"
+	}
+	return fmt.Sprintf("enabled (token_ttl=%ds)", tokenTTLSec)
+}
+
+func valueOrDisabled(v string) string {
+	if v == "" {
+		return "disabled"
+	}
+	return v
+}
+
+func valueOrNone(v string) string {
+	if v == "" {
+		return "(none)"
+	}
+	return v
+}
+
+func valueOrDefault(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
 func main() {
 	if err := rootCmd().Execute(); err != nil {
 		os.Exit(1)
@@ -103,6 +241,33 @@ func runCmd() *cobra.Command {
 				return fmt.Errorf("--follower-wait-mode must be one of \"none\", \"quorum\", or \"all\", got %q", followerWaitMode)
 			}
 
+			logrus.WithFields(startupLogFields(
+				dataDir,
+				listenAddr,
+				s3Bucket,
+				s3Prefix,
+				s3Endpoint,
+				readConsistency,
+				logLevel,
+				nodeID,
+				walSyncUpload,
+				peerListenAddr,
+				advertisePeerAddr,
+				leaderWatchIntervalSec,
+				followerMaxRetries,
+				clientTLSCert,
+				clientTLSCA,
+				peerTLSCert,
+				peerTLSCA,
+				authEnabled,
+				tokenTTLSec,
+				metricsAddr,
+				branchSourceBucket,
+				branchSourcePrefix,
+				branchSourceEndpoint,
+				branchCheckpoint,
+			)).Info("starting strata server")
+
 			cfg := strata.Config{
 				DataDir:             dataDir,
 				ReadConsistency:     strata.ReadConsistency(readConsistency),
@@ -131,6 +296,7 @@ func runCmd() *cobra.Command {
 				}
 				cfg.PeerServerTLS = serverCreds
 				cfg.PeerClientTLS = clientCreds
+				logrus.Info("peer mTLS enabled for node replication")
 			}
 
 			if s3Bucket != "" {
@@ -166,7 +332,12 @@ func runCmd() *cobra.Command {
 				return fmt.Errorf("open node: %w", err)
 			}
 			defer node.Close()
-			logrus.Infof("node started (rev=%d)", node.CurrentRevision())
+			logrus.WithFields(logrus.Fields{
+				"listen_addr": listenAddr,
+				"mode":        runMode(s3Bucket, peerListenAddr, branchSourceBucket),
+				"node_id":     resolvedNodeID(nodeID),
+				"revision":    node.CurrentRevision(),
+			}).Info("strata node opened")
 
 			// ── Auth setup ───────────────────────────────────────────────────
 			var (
@@ -204,7 +375,11 @@ func runCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("listen %s: %w", listenAddr, err)
 			}
-			logrus.Infof("listening on %s", listenAddr)
+			logrus.WithFields(logrus.Fields{
+				"listen_addr": listenAddr,
+				"client_tls":  tlsMode(clientTLSCert, clientTLSCA),
+				"auth":        authEnabled,
+			}).Info("etcd gRPC server listening")
 
 			srv := grpc.NewServer(grpcOpts...)
 			strataetcd.New(node, authStore, tokens).Register(srv)
@@ -217,9 +392,10 @@ func runCmd() *cobra.Command {
 
 			quit := make(chan os.Signal, 1)
 			signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-			<-quit
-			logrus.Info("shutting down…")
+			sig := <-quit
+			logrus.WithField("signal", sig.String()).Info("shutdown signal received")
 			srv.GracefulStop()
+			logrus.Info("gRPC server stopped")
 			return nil
 		},
 	}

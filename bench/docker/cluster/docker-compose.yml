@@ -96,6 +96,7 @@ services:
       - --advertise-peer=strata1:3380
       - --data-dir=/data
       - --metrics-addr=0.0.0.0:9090
+      - --wal-sync-upload=false
       - --s3-bucket=bench
       - --s3-prefix=cluster
       - --s3-endpoint=http://minio:9000
@@ -120,6 +121,7 @@ services:
       - --listen=0.0.0.0:2379
       - --peer-listen=0.0.0.0:3380
       - --advertise-peer=strata2:3380
+      - --wal-sync-upload=false
       - --data-dir=/data
       - --metrics-addr=0.0.0.0:9090
       - --s3-bucket=bench
@@ -146,6 +148,7 @@ services:
       - --listen=0.0.0.0:2379
       - --peer-listen=0.0.0.0:3380
       - --advertise-peer=strata3:3380
+      - --wal-sync-upload=false
       - --data-dir=/data
       - --metrics-addr=0.0.0.0:9090
       - --s3-bucket=bench
