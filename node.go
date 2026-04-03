@@ -137,7 +137,7 @@ type Node struct {
 	leaderCli atomic.Pointer[peer.Client]
 
 	entriesSinceCheckpoint int64
-	checkpointTriggerC     chan struct{} // non-nil when CheckpointEntries > 0; signals entry-count-based checkpoint
+	checkpointTriggerC     chan struct{}       // non-nil when CheckpointEntries > 0; signals entry-count-based checkpoint
 	sstUploader            *istore.SSTUploader // non-nil when ObjectStore is set; streams SSTs to S3
 
 	// bgCtx is cancelled by cancelBg — either on Close() or when fencedCheck
@@ -506,12 +506,21 @@ func Open(cfg Config) (*Node, error) {
 	return n, nil
 }
 
-// serveMetrics starts an HTTP server exposing /metrics, /healthz, /readyz.
+// serveMetrics starts an HTTP server exposing /metrics, /healthz, /readyz,
+// and /healthz/leader (used by Envoy active health checks to identify the leader).
 func (n *Node) serveMetrics(ctx context.Context, addr string) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/healthz/leader", func(w http.ResponseWriter, _ *http.Request) {
+		r := n.loadRole()
+		if r == roleLeader || r == roleSingle {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, "not leader", http.StatusServiceUnavailable)
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if n.db.CurrentRevision() >= 0 {
