@@ -786,35 +786,39 @@ func (n *Node) followLoop(bgCtx context.Context) {
 	fromRev := n.db.CurrentRevision() + 1
 
 	for {
-		err := cli.Follow(bgCtx, fromRev, func(e wal.Entry) error {
-			// Followers must apply a contiguous revision stream. If the leader
-			// stream skips (or rewinds) a revision, force a full resync rather
-			// than silently advancing currentRev with holes.
-			if e.Revision != fromRev {
-				return peer.ErrResyncRequired
-			}
-			if err := n.wal.Append(&e); err != nil {
-				return err
-			}
-			if err := n.db.Apply([]wal.Entry{e}); err != nil {
-				return err
-			}
-			// Track the leader's term so attemptPromotion uses the correct
-			// floorTerm when calling TakeOver.  Without this, n.term stays at
-			// its Open() value and TakeOver backs off because it sees the
-			// current lock term as "already taken over at a higher term".
-			if e.Term > n.term {
-				n.mu.Lock()
-				if e.Term > n.term {
-					n.term = e.Term
+		err := cli.Follow(bgCtx, fromRev,
+			func(e wal.Entry) error {
+				// Followers must persist a contiguous WAL stream. If the leader
+				// stream skips (or rewinds) a revision, force a full resync rather
+				// than acknowledging an entry that would leave a hole.
+				if e.Revision != fromRev {
+					return peer.ErrResyncRequired
 				}
-				n.mu.Unlock()
-			}
-			// Advance only after a successful apply so a reconnect retries
-			// the same revision rather than skipping it.
-			fromRev = e.Revision + 1
-			return nil
-		})
+				return n.wal.Append(&e)
+			},
+			func(e wal.Entry) error {
+				// Followers must apply a contiguous revision stream. If the leader
+				// stream skips (or rewinds) a revision, WAL append already failed
+				// above and forced a resync instead of acknowledging a hole.
+				if err := n.db.Apply([]wal.Entry{e}); err != nil {
+					return err
+				}
+				// Track the leader's term so attemptPromotion uses the correct
+				// floorTerm when calling TakeOver.  Without this, n.term stays at
+				// its Open() value and TakeOver backs off because it sees the
+				// current lock term as "already taken over at a higher term".
+				if e.Term > n.term {
+					n.mu.Lock()
+					if e.Term > n.term {
+						n.term = e.Term
+					}
+					n.mu.Unlock()
+				}
+				// Advance only after a successful apply so a reconnect retries
+				// from the first revision that is not yet reflected in Pebble.
+				fromRev = e.Revision + 1
+				return nil
+			})
 
 		if bgCtx.Err() != nil {
 			return

@@ -81,18 +81,21 @@ func (c *Client) getConn() (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
-// Follow streams WAL entries from the leader starting at fromRev, calling
-// applyFn for each entry. fromRev advances automatically as entries are applied.
+// Follow streams WAL entries from the leader starting at fromRev. For each
+// entry it first calls walFn to durably append the entry to the follower WAL,
+// then ACKs the revision to the leader, then calls applyFn to update the
+// follower's local state. fromRev advances automatically once WAL append
+// succeeds.
 //
 // Follow reconnects on transient errors. It returns:
 //   - ctx.Err() on context cancellation.
 //   - ErrResyncRequired when the leader's buffer no longer covers fromRev.
 //   - ErrLeaderUnreachable after maxRetries consecutive connection failures.
 //   - ErrLeaderShutdown when the leader sent a graceful shutdown signal.
-func (c *Client) Follow(ctx context.Context, fromRev int64, applyFn func(wal.Entry) error) error {
+func (c *Client) Follow(ctx context.Context, fromRev int64, walFn func(wal.Entry) error, applyFn func(wal.Entry) error) error {
 	consecutiveFailures := 0
 	for {
-		nextRev, err := c.followOnce(ctx, fromRev, applyFn)
+		nextRev, err := c.followOnce(ctx, fromRev, walFn, applyFn)
 
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -129,8 +132,10 @@ func (c *Client) Follow(ctx context.Context, fromRev int64, applyFn func(wal.Ent
 }
 
 // followOnce makes one streaming attempt using the shared connection.
-// Returns the next fromRev (last applied revision + 1) on any error.
-func (c *Client) followOnce(ctx context.Context, fromRev int64, applyFn func(wal.Entry) error) (int64, error) {
+// walFn must durably append the entry to the follower's local WAL.
+// applyFn updates follower local state after the ACK has been sent.
+// Returns the next fromRev (highest WAL-durable revision + 1) on any error.
+func (c *Client) followOnce(ctx context.Context, fromRev int64, walFn func(wal.Entry) error, applyFn func(wal.Entry) error) (int64, error) {
 	conn, err := c.getConn()
 	if err != nil {
 		return fromRev, err
@@ -155,13 +160,18 @@ func (c *Client) followOnce(ctx context.Context, fromRev int64, applyFn func(wal
 			return fromRev, ErrLeaderShutdown
 		}
 		e := MsgToEntry(msg)
-		if err := applyFn(e); err != nil {
+		if err := walFn(e); err != nil {
+			return fromRev, err
+		}
+		// ACK after durable local WAL write so the leader can form quorum
+		// without waiting for this follower's Pebble apply.
+		// Best-effort: a send error just causes reconnect, which is safe.
+		if err := stream.SendAck(e.Revision); err != nil {
+			fromRev = e.Revision + 1
 			return fromRev, err
 		}
 		fromRev = e.Revision + 1
-		// ACK after durable local WAL write (applyFn writes to WAL before Pebble).
-		// Best-effort: a send error just causes reconnect, which is safe.
-		if err := stream.SendAck(e.Revision); err != nil {
+		if err := applyFn(e); err != nil {
 			return fromRev, err
 		}
 	}
