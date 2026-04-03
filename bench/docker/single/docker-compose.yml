@@ -24,6 +24,11 @@ services:
       - --log-level=warn
     ports:
       - "3379:2379"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
     volumes:
       - strata-data:/data
     healthcheck:
@@ -49,6 +54,11 @@ services:
       - "2379:2379"
     volumes:
       - etcd-data:/etcd-data
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
     healthcheck:
       test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
       interval: 5s

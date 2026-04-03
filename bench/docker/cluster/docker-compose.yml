@@ -30,10 +30,20 @@ x-strata-base: &strata-base
     minio-init:
       condition: service_completed_successfully
   networks: [bench]
+  deploy:
+    resources:
+      limits:
+        cpus: '2'
+        memory: 4G
 
 x-etcd-base: &etcd-base
   image: gcr.io/etcd-development/etcd:v3.6.4
   networks: [bench]
+  deploy:
+    resources:
+      limits:
+        cpus: '2'
+        memory: 4G
 
 # Shared etcd cluster environment (node-specific vars added per service).
 x-etcd-cluster-env: &etcd-cluster-env

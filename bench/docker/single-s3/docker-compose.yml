@@ -61,6 +61,11 @@ services:
       AWS_ACCESS_KEY_ID: bench
       AWS_SECRET_ACCESS_KEY: bench123
       AWS_DEFAULT_REGION: us-east-1
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
     ports:
       - "3379:2379"
     volumes:
@@ -86,6 +91,11 @@ services:
       - --initial-cluster=etcd0=http://etcd:2380
     ports:
       - "2379:2379"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
     volumes:
       - etcd-data:/etcd-data
     healthcheck:
