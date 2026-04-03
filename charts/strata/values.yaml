@@ -192,3 +192,53 @@ affinity:
           topologyKey: kubernetes.io/hostname
 
 imagePullSecrets: []
+
+# ── Envoy proxy (optional) ────────────────────────────────────────────────────
+# When enabled, deploys a small Envoy Deployment that:
+#   - Routes mutating gRPC methods (Put, DeleteRange, Txn, Compact, Lease*, Auth*)
+#     exclusively to the current leader (detected via /healthz/leader).
+#   - Load-balances read methods (Range, Watch, ...) across all healthy nodes,
+#     giving ~N× read throughput with serializable consistency.
+#
+# Clients connect to the proxy Service instead of strata directly.
+# Requires replicaCount > 1 and config.metricsAddr to be set.
+proxy:
+  enabled: false
+
+  image:
+    repository: envoyproxy/envoy
+    tag: v1.33-latest
+    pullPolicy: IfNotPresent
+
+  replicaCount: 2
+
+  service:
+    type: ClusterIP
+    port: 3379
+    annotations: {}
+
+  # Load balancing policy for the read cluster (all nodes).
+  # ROUND_ROBIN    — default, even distribution by request count.
+  # LEAST_REQUEST  — routes to the replica with fewest active requests;
+  #                  better when read latency varies across nodes.
+  # RANDOM         — uniform random selection.
+  # RING_HASH      — consistent hashing on the downstream address;
+  #                  useful to maximise local cache hit rates per node.
+  # MAGLEV         — consistent hashing with better load spread than RING_HASH.
+  #
+  # Note: the write cluster (strata_leader) always uses ROUND_ROBIN because
+  # only one endpoint is ever healthy — the policy has no practical effect there.
+  lbPolicy: ROUND_ROBIN
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+  podAnnotations: {}
+  podLabels: {}
+
+  nodeSelector: {}
+  tolerations: []
