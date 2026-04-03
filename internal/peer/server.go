@@ -2,15 +2,15 @@ package peer
 
 import (
 	"context"
-	"sync"
-
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/makhov/strata/internal/metrics"
 	"github.com/makhov/strata/internal/wal"
 )
 
@@ -246,11 +246,13 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 		s.mu.Unlock()
 		logrus.Warnf("peer: follower %q needs resync (fromRev=%d < leaderStartRev=%d)",
 			req.NodeID, req.FromRevision, s.startRev)
+		metrics.FollowerResyncsTotal.WithLabelValues("behind_leader_start").Inc()
 		return ErrResyncRequired
 	}
 	snapshot, ok := s.buf.since(req.FromRevision)
 	if !ok {
 		s.mu.Unlock()
+		metrics.FollowerResyncsTotal.WithLabelValues("ring_buffer_miss").Inc()
 		return ErrResyncRequired
 	}
 	ch := make(chan *wal.Entry, 512)

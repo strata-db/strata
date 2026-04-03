@@ -887,6 +887,7 @@ func (n *Node) followLoop(bgCtx context.Context) {
 		}
 
 		if peer.IsResyncRequired(err) {
+			metrics.FollowerResyncsTotal.WithLabelValues("stream_gap").Inc()
 			if n.cfg.ObjectStore == nil {
 				logrus.Error("strata: follower resync required but no object store — restart node")
 				n.cancelBg()
@@ -1202,7 +1203,14 @@ func (n *Node) syncWithLeader(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("strata: read sync: %w", err)
 	}
-	return n.WaitForRevision(ctx, resp.Revision)
+	if err := n.WaitForRevision(ctx, resp.Revision); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return fmt.Errorf("strata: read sync: leader reported rev=%d but local node only reached rev=%d before wait ended: %w",
+				resp.Revision, n.db.CurrentRevision(), err)
+		}
+		return fmt.Errorf("strata: read sync: wait for local revision %d: %w", resp.Revision, err)
+	}
+	return nil
 }
 
 // LinearizableGet returns the value for key with linearizability guaranteed.
@@ -1576,6 +1584,9 @@ func (n *Node) readKey(key string) (*istore.KeyValue, error) {
 		if p.deleted {
 			return nil, nil
 		}
+		// pending is an optimistic local read path: once a write has been
+		// assigned a revision under n.mu, concurrent writes to the same key
+		// observe that in-flight state before the batch is durably applied.
 		return p.kv, nil
 	}
 	return n.db.Get(key)
@@ -1644,6 +1655,22 @@ func (n *Node) await(ctx context.Context, req *writeReq, op string, start time.T
 		}
 	}
 	return rev, nil
+}
+
+// clearPendingBatch removes optimistic pending entries for one commit-loop
+// batch. If a newer write has already reused the same key, the revision guard
+// preserves that newer pending entry.
+func (n *Node) clearPendingBatch(batch []*writeReq) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, req := range batch {
+		if req.entry.Key == "" {
+			continue
+		}
+		if p, ok := n.pending[req.entry.Key]; ok && p.rev == req.entry.Revision {
+			delete(n.pending, req.entry.Key)
+		}
+	}
 }
 
 // commitLoop is the group-commit pipeline for leader/single-node writes.
@@ -1769,6 +1796,10 @@ func (n *Node) commitLoop(ctx context.Context) {
 			}
 			err = n.db.Apply(dbEntries)
 		}
+
+		// Clear optimistic state before waking callers so a failed batch cannot
+		// leak stale pending revisions into a racing follow-up write.
+		n.clearPendingBatch(batch)
 
 		// Signal all callers.
 		for _, req := range batch {

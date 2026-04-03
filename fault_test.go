@@ -200,3 +200,27 @@ func TestCommitLoopDeathUnblocksWrites(t *testing.T) {
 		t.Fatal("write goroutine never returned: stuck waiting on done channel")
 	}
 }
+
+func TestClearPendingBatchRemovesOnlyMatchingRevisions(t *testing.T) {
+	n := &Node{
+		pending: map[string]pendingKV{
+			"/same": {rev: 2, kv: nil},
+			"/gone": {rev: 3, kv: nil},
+		},
+	}
+
+	batch := []*writeReq{
+		{entry: wal.Entry{Key: "/same", Revision: 1}},
+		{entry: wal.Entry{Key: "/gone", Revision: 3}},
+		{entry: wal.Entry{Revision: 4}}, // compact/no-key path
+	}
+
+	n.clearPendingBatch(batch)
+
+	if _, ok := n.pending["/gone"]; ok {
+		t.Fatal("matching pending entry was not cleared")
+	}
+	if got, ok := n.pending["/same"]; !ok || got.rev != 2 {
+		t.Fatalf("newer pending entry was incorrectly removed: %+v", got)
+	}
+}

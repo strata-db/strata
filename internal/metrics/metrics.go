@@ -97,6 +97,13 @@ var (
 		Name: "strata_elections_total",
 		Help: "Total leader election attempts by outcome (won/lost).",
 	}, []string{"outcome"})
+
+	// FollowerResyncsTotal counts follower restores triggered by falling out of
+	// the leader's streaming window or detecting a revision gap.
+	FollowerResyncsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "strata_follower_resyncs_total",
+		Help: "Total follower resyncs by trigger reason.",
+	}, []string{"reason"})
 )
 
 // SetRole updates the role gauges so exactly one has value 1.
