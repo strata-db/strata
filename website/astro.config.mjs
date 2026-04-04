@@ -20,6 +20,9 @@ export default defineConfig({
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/strata-db/strata' },
 			],
 			customCss: ['./src/styles/custom.css'],
+			components: {
+				Hero: './src/components/Hero.astro',
+			},
 			sidebar: [
 				{ label: 'Getting Started', slug: 'getting-started' },
 				{
