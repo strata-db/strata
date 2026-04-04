@@ -254,7 +254,7 @@ func TestAuthStore_CheckPermission(t *testing.T) {
 func TestTokenStore_GenerateLookup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ts := auth.NewTokenStore(ctx, 5*time.Minute)
+	ts := auth.NewTokenStore(ctx, 5*time.Minute, nil)
 
 	tok, err := ts.Generate("alice")
 	if err != nil {
@@ -272,7 +272,7 @@ func TestTokenStore_GenerateLookup(t *testing.T) {
 func TestTokenStore_Revoke(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ts := auth.NewTokenStore(ctx, 5*time.Minute)
+	ts := auth.NewTokenStore(ctx, 5*time.Minute, nil)
 
 	tok, _ := ts.Generate("alice")
 	ts.Revoke(tok)
@@ -284,12 +284,113 @@ func TestTokenStore_Revoke(t *testing.T) {
 func TestTokenStore_Expiry(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ts := auth.NewTokenStore(ctx, 50*time.Millisecond)
+	ts := auth.NewTokenStore(ctx, 50*time.Millisecond, nil)
 
 	tok, _ := ts.Generate("alice")
 	time.Sleep(100 * time.Millisecond)
 	if _, ok := ts.Lookup(tok); ok {
 		t.Fatal("expected token to be expired")
+	}
+}
+
+func TestTokenStore_PersistenceAcrossRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	node := newNode(t)
+	ts := auth.NewTokenStore(ctx, 5*time.Minute, node)
+
+	tok, err := ts.Generate("alice")
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	// Simulate a restart: create a new TokenStore backed by the same node.
+	ts2 := auth.NewTokenStore(ctx, 5*time.Minute, node)
+	user, ok := ts2.Lookup(tok)
+	if !ok {
+		t.Fatal("token not found after simulated restart")
+	}
+	if user != "alice" {
+		t.Fatalf("got user %q after restart, want alice", user)
+	}
+}
+
+func TestTokenStore_RevokeDeletedFromPebble(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	node := newNode(t)
+	ts := auth.NewTokenStore(ctx, 5*time.Minute, node)
+
+	tok, _ := ts.Generate("alice")
+	ts.Revoke(tok)
+
+	// New TokenStore backed by same node should not find the revoked token.
+	ts2 := auth.NewTokenStore(ctx, 5*time.Minute, node)
+	if _, ok := ts2.Lookup(tok); ok {
+		t.Fatal("revoked token should not be visible after restart")
+	}
+}
+
+// ── RateLimiter tests ─────────────────────────────────────────────────────────
+
+func TestAuth_RateLimitLockout(t *testing.T) {
+	ctx := context.Background()
+	node := newNode(t)
+	store := newStore(t, node)
+
+	if err := store.PutUser(ctx, auth.User{Name: "alice"}, "correct"); err != nil {
+		t.Fatalf("PutUser: %v", err)
+	}
+
+	// Exhaust the failure budget with wrong passwords.
+	for i := 0; i < 5; i++ {
+		if err := store.CheckPassword("alice", "wrong"); err == nil {
+			t.Fatalf("attempt %d: expected error", i+1)
+		}
+	}
+
+	// The next attempt — even with the correct password — must be rejected.
+	if err := store.CheckPassword("alice", "correct"); err == nil {
+		t.Fatal("expected lockout error after too many failures")
+	}
+}
+
+func TestAuth_RateLimitResetOnSuccess(t *testing.T) {
+	ctx := context.Background()
+	node := newNode(t)
+	store := newStore(t, node)
+
+	if err := store.PutUser(ctx, auth.User{Name: "alice"}, "correct"); err != nil {
+		t.Fatalf("PutUser: %v", err)
+	}
+
+	// A few failures followed by a success should reset the counter.
+	for i := 0; i < 3; i++ {
+		store.CheckPassword("alice", "wrong") //nolint:errcheck
+	}
+	if err := store.CheckPassword("alice", "correct"); err != nil {
+		t.Fatalf("correct password denied after partial failures: %v", err)
+	}
+	// Subsequent failures should start from zero again.
+	for i := 0; i < 4; i++ {
+		store.CheckPassword("alice", "wrong") //nolint:errcheck
+	}
+	// 4 failures after a reset should not lock (threshold is 5).
+	if err := store.CheckPassword("alice", "correct"); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+}
+
+func TestAuth_RateLimitUnknownUser(t *testing.T) {
+	store := newStore(t, newNode(t))
+	// Failures for an unknown user should not panic and should eventually lock.
+	for i := 0; i < 5; i++ {
+		store.CheckPassword("ghost", "x") //nolint:errcheck
+	}
+	if err := store.CheckPassword("ghost", "x"); err == nil {
+		t.Fatal("expected lockout for unknown user after many failures")
 	}
 }
 
@@ -299,7 +400,7 @@ func TestAuth_UnauthenticatedDenied(t *testing.T) {
 	ctx := context.Background()
 	node := newNode(t)
 	store := newStore(t, node)
-	tokens := auth.NewTokenStore(ctx, 5*time.Minute)
+	tokens := auth.NewTokenStore(ctx, 5*time.Minute, nil)
 
 	if err := store.PutUser(ctx, auth.User{Name: auth.RootUser}, "rootpass"); err != nil {
 		t.Fatalf("PutUser: %v", err)
@@ -321,7 +422,7 @@ func TestAuth_RootUserFullAccess(t *testing.T) {
 	ctx := context.Background()
 	node := newNode(t)
 	store := newStore(t, node)
-	tokens := auth.NewTokenStore(ctx, 5*time.Minute)
+	tokens := auth.NewTokenStore(ctx, 5*time.Minute, nil)
 
 	if err := store.PutUser(ctx, auth.User{Name: auth.RootUser}, "rootpass"); err != nil {
 		t.Fatalf("PutUser: %v", err)
@@ -358,7 +459,7 @@ func TestAuth_RBACKeyPrefixEnforced(t *testing.T) {
 	ctx := context.Background()
 	node := newNode(t)
 	store := newStore(t, node)
-	tokens := auth.NewTokenStore(ctx, 5*time.Minute)
+	tokens := auth.NewTokenStore(ctx, 5*time.Minute, nil)
 
 	if err := store.PutUser(ctx, auth.User{Name: auth.RootUser}, "rootpass"); err != nil {
 		t.Fatalf("PutUser root: %v", err)
@@ -401,7 +502,7 @@ func TestAuth_AuthNamespaceBlocked(t *testing.T) {
 	ctx := context.Background()
 	node := newNode(t)
 	store := newStore(t, node)
-	tokens := auth.NewTokenStore(ctx, 5*time.Minute)
+	tokens := auth.NewTokenStore(ctx, 5*time.Minute, nil)
 
 	if err := store.PutUser(ctx, auth.User{Name: auth.RootUser}, "r"); err != nil {
 		t.Fatalf("PutUser: %v", err)

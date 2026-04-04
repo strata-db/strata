@@ -110,7 +110,7 @@ func setupAuthStore(b *testing.B) (*auth.Store, *auth.TokenStore, string) {
 
 	node := newBenchNode(b)
 	store := newBenchStore(b, node)
-	tokens := auth.NewTokenStore(ctx, 5*time.Minute)
+	tokens := auth.NewTokenStore(ctx, 5*time.Minute, nil)
 
 	// Root user (required before Enable).
 	if err := store.PutUser(ctx, auth.User{Name: auth.RootUser}, "rootpass"); err != nil {

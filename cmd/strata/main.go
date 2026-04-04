@@ -349,7 +349,7 @@ func runCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("init auth store: %w", err)
 				}
-				tokens = auth.NewTokenStore(cmd.Context(), time.Duration(tokenTTLSec)*time.Second)
+				tokens = auth.NewTokenStore(cmd.Context(), time.Duration(tokenTTLSec)*time.Second, node)
 				logrus.Infof("auth enabled (token TTL %ds)", tokenTTLSec)
 			}
 

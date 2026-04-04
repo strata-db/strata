@@ -104,6 +104,12 @@ var (
 		Name: "strata_follower_resyncs_total",
 		Help: "Total follower resyncs by trigger reason.",
 	}, []string{"reason"})
+
+	// AuthAttemptsTotal counts authentication attempts by result.
+	AuthAttemptsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "strata_auth_attempts_total",
+		Help: "Total authentication attempts by result (success/fail/locked).",
+	}, []string{"result"})
 )
 
 // SetRole updates the role gauges so exactly one has value 1.

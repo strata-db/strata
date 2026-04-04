@@ -10,15 +10,17 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/makhov/strata"
+	"github.com/makhov/strata/internal/metrics"
 )
 
 const (
 	// authPrefix is the reserved Pebble key namespace for auth data.
 	// The null byte ensures no normal etcd client key can collide.
-	authPrefix  = "\x00auth/"
-	enabledKey  = "\x00auth/enabled"
-	usersPrefix = "\x00auth/users/"
-	rolesPrefix = "\x00auth/roles/"
+	authPrefix   = "\x00auth/"
+	enabledKey   = "\x00auth/enabled"
+	usersPrefix  = "\x00auth/users/"
+	rolesPrefix  = "\x00auth/roles/"
+	tokensPrefix = "\x00auth/tokens/"
 
 	bcryptCost = bcrypt.DefaultCost
 )
@@ -44,15 +46,17 @@ type Store struct {
 	enabled bool
 	users   map[string]User
 	roles   map[string]Role
+	rateLim *rateLimiter
 }
 
 // NewStore creates a Store backed by n and loads the current auth state from
 // Pebble.
 func NewStore(n node) (*Store, error) {
 	s := &Store{
-		n:     n,
-		users: make(map[string]User),
-		roles: make(map[string]Role),
+		n:       n,
+		users:   make(map[string]User),
+		roles:   make(map[string]Role),
+		rateLim: newRateLimiter(),
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -156,16 +160,27 @@ func (s *Store) ListUsers() ([]User, error) {
 
 // CheckPassword returns nil when password matches the stored hash for name.
 func (s *Store) CheckPassword(name, password string) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	if s.rateLim.IsLocked(name) {
+		metrics.AuthAttemptsTotal.WithLabelValues("locked").Inc()
+		return errors.New("authentication failed: too many attempts, try again later")
+	}
 
+	s.mu.RLock()
 	u, err := s.getUser(name)
+	s.mu.RUnlock()
+
 	if err != nil {
+		s.rateLim.RecordFailure(name)
+		metrics.AuthAttemptsTotal.WithLabelValues("fail").Inc()
 		return errors.New("authentication failed")
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
+		s.rateLim.RecordFailure(name)
+		metrics.AuthAttemptsTotal.WithLabelValues("fail").Inc()
 		return errors.New("authentication failed")
 	}
+	s.rateLim.RecordSuccess(name)
+	metrics.AuthAttemptsTotal.WithLabelValues("success").Inc()
 	return nil
 }
 
