@@ -146,6 +146,13 @@ func (u *SSTUploader) Reconcile(ctx context.Context) error {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sst") {
 			continue
 		}
+		// Skip SST files that are still being written by Pebble (TableCreated
+		// fires when the file is created but still empty; data is written before
+		// FlushEnd/CompactionEnd). Uploading a 0-byte file here would poison the
+		// local registry and prevent the correct upload triggered by those events.
+		if info, err := e.Info(); err != nil || info.Size() == 0 {
+			continue
+		}
 		u.mu.RLock()
 		_, inLocal := u.local[e.Name()]
 		_, inInherited := u.inherited[e.Name()]

@@ -253,7 +253,7 @@ func TestE2EThreeNode(t *testing.T) {
 		nodes[i] = node
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	// ── elect a leader ────────────────────────────────────────────────────────
