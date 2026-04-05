@@ -4,6 +4,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/strata-db/strata.svg)](https://pkg.go.dev/github.com/strata-db/strata)
 [![Go Report Card](https://goreportcard.com/badge/github.com/strata-db/strata)](https://goreportcard.com/report/github.com/strata-db/strata)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-strata--db.github.io-green)](https://strata-db.github.io/strata/)
 
 An embeddable, S3-durable key-value store for Go.
 
@@ -75,16 +76,27 @@ etcdctl --endpoints=localhost:3379 put /hello world
 etcdctl --endpoints=localhost:3379 get /hello
 ```
 
-Multi-node and production setup: see [docs/operations.md](docs/operations.md).
+Multi-node and production setup: see [Operations](https://strata-db.github.io/strata/operations/).
 
 ---
 
 ## Documentation
 
+Full documentation is available at **[strata-db.github.io/strata](https://strata-db.github.io/strata/)**.
+
 | Document | Contents |
 |---|---|
-| [docs/api.md](docs/api.md) | Full Go API reference — methods, types, errors, branching |
-| [docs/configuration.md](docs/configuration.md) | All config fields and CLI flags |
-| [docs/operations.md](docs/operations.md) | Multi-node, S3, TLS, authentication, RBAC, observability, branching, point-in-time restore |
-| [docs/architecture.md](docs/architecture.md) | Internals — WAL, checkpoints, election, replication |
-| [docs/benchmarks.md](docs/benchmarks.md) | Strata vs etcd benchmark results and analysis |
+| [Getting Started](https://strata-db.github.io/strata/getting-started/) | Quickstart for standalone server and embedded Go library |
+| [API Reference](docs/api.md) | Full Go API — methods, types, errors, branching |
+| [Configuration](docs/configuration.md) | All config fields and CLI flags |
+| [Operations](docs/operations.md) | Multi-node clusters, S3, TLS, authentication, RBAC, observability |
+| [Backup and Restore](docs/backup-restore.md) | Checkpoints, point-in-time restore, branching, retention |
+| [Security](https://strata-db.github.io/strata/security/) | TLS, mTLS, client auth, RBAC setup |
+| [Recipes](https://strata-db.github.io/strata/recipes/) | Distributed locks, service discovery, common patterns |
+| [Kubernetes](https://strata-db.github.io/strata/deployment/kubernetes/) | Helm chart, StatefulSet deployment |
+| [Docker Compose](https://strata-db.github.io/strata/deployment/docker-compose/) | Local, MinIO-backed, and multi-node cluster examples |
+| [Architecture](docs/architecture.md) | Internals — WAL, checkpoints, leader election, replication |
+| [Benchmarks](docs/benchmarks.md) | Strata vs etcd benchmark results and analysis |
+| [Migrating from etcd](https://strata-db.github.io/strata/etcd-migration/) | Compatibility table and migration steps |
+| [Troubleshooting](https://strata-db.github.io/strata/troubleshooting/) | Diagnostics, debug logging, and common fixes |
+| [FAQ](https://strata-db.github.io/strata/faq/) | Frequently asked questions |

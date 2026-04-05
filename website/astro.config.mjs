@@ -31,6 +31,7 @@ export default defineConfig({
 						{ label: 'API Reference', slug: 'api' },
 						{ label: 'Configuration', slug: 'configuration' },
 						{ label: 'Operations', slug: 'operations' },
+						{ label: 'Backup and Restore', slug: 'backup-restore' },
 						{ label: 'Security', slug: 'security' },
 						{ label: 'Recipes', slug: 'recipes' },
 					],
@@ -46,6 +47,8 @@ export default defineConfig({
 					label: 'Reference',
 					items: [
 						{ label: 'Architecture', slug: 'architecture' },
+						{ label: 'Consistency Model', slug: 'consistency' },
+						{ label: 'Failure Scenarios', slug: 'failure-scenarios' },
 						{ label: 'Benchmarks', slug: 'benchmarks' },
 					],
 				},
