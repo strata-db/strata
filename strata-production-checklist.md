@@ -64,7 +64,7 @@ It is divided into stages and clear pass/fail requirements.
 ## Stage 3 — Production Ready
 
 ### Reliability
-- [ ] Passes repeated chaos testing
+- [x] Passes repeated chaos testing — `TestChaos` (5 rounds default, up to 20+ validated; random node kills, fresh data dir restarts, full consistency verification); set `STRATA_CHAOS_ROUNDS=N` for soak runs
 - [ ] No data corruption in long soak tests (≥ 1 week)
 - [x] WAL corruption recovery tested — `TestWALCorruptionMidSegment` (CRC mismatch mid-segment: partial recovery + logged warning); `TestWALReplayAfterPartialUpload` (truncated upload)
 - [x] Checkpoint corruption recovery tested — `TestCheckpointCorruptionManifest`, `TestCheckpointCorruptionArchive`
@@ -104,10 +104,10 @@ It is divided into stages and clear pass/fail requirements.
 
 ### Documentation
 - [x] Architecture doc — `docs/architecture.md`
-- [ ] Consistency model doc — partial (scattered across `docs/configuration.md`)
-- [ ] Failure scenarios doc — not comprehensive; no dedicated doc
-- [ ] Backup / restore guide — no dedicated guide
-- [ ] Kubernetes integration guide — not present
+- [x] Consistency model doc — `docs/consistency.md` (write durability, linearizable vs serializable, CAP, split-brain, partition behaviour, data-loss table)
+- [x] Failure scenarios doc — `docs/failure-scenarios.md` (leader/follower crash, S3 outage, network partition, WAL/checkpoint corruption, chaos, failover timing)
+- [x] Backup / restore guide — `docs/backup-restore.md` (auto checkpoints, restore latest/arbitrary, multi-node restore, zero-copy branching, PITR, GC, verification)
+- [x] Kubernetes integration guide — `docs/kubernetes.md` + `website/src/content/docs/deployment/kubernetes.md` (Helm chart, raw manifests, IAM, ephemeral pods, probes, rolling upgrade, Prometheus)
 
 ### Usability
 - [ ] CLI complete (backup, restore, branch, gc, status) — branch CLI done; no gc/status/backup subcommands
@@ -117,7 +117,7 @@ It is divided into stages and clear pass/fail requirements.
 ### Supportability
 - [ ] Runbooks for incidents
 - [ ] Troubleshooting guide
-- [ ] Metrics dashboard examples
+- [x] Metrics dashboard examples — `docs/grafana-dashboard.json`; 5 rows: cluster health, write perf, replication, WAL/checkpoints, S3; imported via Grafana UI; linked from `docs/operations.md`
 
 ---
 
@@ -125,11 +125,11 @@ It is divided into stages and clear pass/fail requirements.
 
 Strata can be called production-ready if:
 
-- [ ] All Stage 2 requirements are complete
-- [ ] Failure scenarios are tested and reproducible
-- [ ] Restore is proven and documented
-- [ ] Consistency guarantees are explicit
-- [ ] System runs Kubernetes reliably under real workloads
+- [x] All Stage 2 requirements are complete
+- [x] Failure scenarios are tested and reproducible — `TestChaos`, `TestNetworkPartitionNoSplitBrain`, `TestLeaderCrashBeforeWALFlush`, `TestFollowerKilledDuringCommit`, `TestObjectStoreUnavailableWritesSucceed`; documented in `docs/failure-scenarios.md`
+- [x] Restore is proven and documented — `TestRestorePoint`; `docs/backup-restore.md`
+- [x] Consistency guarantees are explicit — `docs/consistency.md`
+- [ ] System runs Kubernetes reliably under real workloads — Helm chart + manifests documented; not yet validated under production load
 - [ ] Another engineer can deploy and recover the system using only documentation
 
 ---

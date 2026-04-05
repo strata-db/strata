@@ -338,6 +338,27 @@ strata run --metrics-addr 0.0.0.0:9090 ...
 | `GET /healthz` | 200 once the node has started |
 | `GET /readyz` | 200 when the node is ready to serve reads |
 
+### Grafana dashboard
+
+A pre-built Grafana dashboard is available at `docs/grafana-dashboard.json` (also served as `/grafana-dashboard.json` from the documentation site).
+
+To import it:
+
+1. In Grafana, go to **Dashboards → Import**.
+2. Upload `grafana-dashboard.json` or paste its contents.
+3. Select your Prometheus datasource when prompted.
+4. Set the **job** variable to match the scrape job name for your Strata instances (default: `strata`).
+
+The dashboard contains five sections:
+
+| Section | Panels |
+|---|---|
+| **Cluster Health** | Leader count (split-brain indicator), current revision, node roles, max follower lag, elections/hr, resyncs/hr |
+| **Write Performance** | Throughput by op type, error rate, p50/p95/p99 write latency |
+| **Replication** | Per-follower lag over time, forwarded write rate, forward round-trip latency |
+| **WAL & Checkpoints** | Upload rate, upload errors, upload duration, checkpoint frequency |
+| **Object Store (S3)** | Op rate by type, error rate, p50/p95/p99 latency |
+
 ### Prometheus metrics
 
 | Metric | Type | Labels | Description |

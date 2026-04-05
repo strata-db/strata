@@ -1,0 +1,738 @@
+{
+  "title": "Strata Overview",
+  "uid": "strata-overview",
+  "description": "Cluster health, write performance, replication lag, WAL/checkpoint activity, and S3 object store metrics for a Strata node or cluster.",
+  "schemaVersion": 38,
+  "version": 1,
+  "tags": ["strata"],
+  "timezone": "browser",
+  "graphTooltip": 1,
+  "editable": true,
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "30s",
+  "fiscalYearStartMonth": 0,
+  "links": [],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource",
+        "label": "Datasource"
+      },
+      {
+        "current": {},
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "definition": "label_values(strata_current_revision, job)",
+        "hide": 0,
+        "includeAll": false,
+        "name": "job",
+        "query": "label_values(strata_current_revision, job)",
+        "refresh": 2,
+        "sort": 1,
+        "type": "query",
+        "label": "Job"
+      },
+      {
+        "current": {},
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "definition": "label_values(strata_current_revision{job=\"$job\"}, instance)",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "name": "instance",
+        "query": "label_values(strata_current_revision{job=\"$job\"}, instance)",
+        "refresh": 2,
+        "sort": 1,
+        "type": "query",
+        "label": "Instance"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "Cluster Health",
+      "type": "row"
+    },
+    {
+      "id": 2,
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "type": "stat",
+      "title": "Leaders",
+      "description": "Number of nodes reporting role=leader. Should be exactly 1.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(strata_role{job=\"$job\", instance=~\"$instance\", role=\"leader\"})",
+          "legendFormat": "leaders",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [
+            { "type": "value", "options": { "0": { "color": "red",   "text": "NO LEADER",  "index": 0 } } },
+            { "type": "value", "options": { "1": { "color": "green", "text": "OK (1)",      "index": 1 } } },
+            { "type": "value", "options": { "2": { "color": "orange","text": "SPLIT BRAIN", "index": 2 } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": null },
+              { "color": "green",  "value": 1 },
+              { "color": "orange", "value": 2 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "type": "stat",
+      "title": "Current Revision",
+      "description": "Highest applied revision on this node.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "max(strata_current_revision{job=\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "revision",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "blue" },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "type": "stat",
+      "title": "Node Roles",
+      "description": "Breakdown of node roles in the cluster.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (role) (strata_role{job=\"$job\", instance=~\"$instance\", role!=\"\"})",
+          "legendFormat": "{{role}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "vertical",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "name"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }]
+          }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "type": "stat",
+      "title": "Follower Lag (max)",
+      "description": "Maximum revision lag across all connected followers.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "max(strata_follower_lag_revisions{job=\"$job\", instance=~\"$instance\"}) or vector(0)",
+          "legendFormat": "max lag",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 100 },
+              { "color": "red",    "value": 1000 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "type": "stat",
+      "title": "Elections (1h)",
+      "description": "Leader elections won in the last hour. Elevated count indicates instability.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "increase(strata_elections_total{job=\"$job\", instance=~\"$instance\", outcome=\"won\"}[1h])",
+          "legendFormat": "won",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 3 },
+              { "color": "red",    "value": 10 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 7,
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "type": "stat",
+      "title": "Follower Resyncs (1h)",
+      "description": "Full follower resyncs from S3 checkpoint. Should be 0 in normal operation.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "increase(strata_follower_resyncs_total{job=\"$job\", instance=~\"$instance\"}[1h])",
+          "legendFormat": "resyncs",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red",    "value": 5 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "id": 10,
+      "title": "Write Performance",
+      "type": "row"
+    },
+    {
+      "id": 11,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 6 },
+      "type": "timeseries",
+      "title": "Write Throughput",
+      "description": "Successful write operations per second by op type.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (op) (rate(strata_writes_total{job=\"$job\", instance=~\"$instance\"}[2m]))",
+          "legendFormat": "{{op}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 6 },
+      "type": "timeseries",
+      "title": "Write Error Rate",
+      "description": "Write errors as a fraction of total write attempts.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (op) (rate(strata_write_errors_total{job=\"$job\", instance=~\"$instance\"}[2m]))\n/ (\n  sum by (op) (rate(strata_writes_total{job=\"$job\", instance=~\"$instance\"}[2m]))\n  + sum by (op) (rate(strata_write_errors_total{job=\"$job\", instance=~\"$instance\"}[2m]))\n)",
+          "legendFormat": "error rate ({{op}})",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red",   "value": 0.01 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 13,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
+      "type": "timeseries",
+      "title": "Write Latency (p50 / p95 / p99)",
+      "description": "WAL write latency percentiles (all op types combined).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(strata_write_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(strata_write_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(strata_write_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "s"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "p99" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+        ]
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "id": 20,
+      "title": "Replication",
+      "type": "row"
+    },
+    {
+      "id": 21,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "type": "timeseries",
+      "title": "Follower Lag",
+      "description": "Revision lag per connected follower. 0 = fully caught up. Absent = no followers.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "strata_follower_lag_revisions{job=\"$job\", instance=~\"$instance\"}",
+          "legendFormat": "{{follower_id}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "short",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 100 },
+              { "color": "red",    "value": 1000 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 22,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "type": "timeseries",
+      "title": "Forwarded Writes",
+      "description": "Write operations forwarded from follower to leader per second.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (op) (rate(strata_forwarded_writes_total{job=\"$job\", instance=~\"$instance\"}[2m]))",
+          "legendFormat": "forwarded ({{op}})",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "type": "timeseries",
+      "title": "Forward Latency (p50 / p95 / p99)",
+      "description": "Round-trip latency for writes forwarded from follower to leader.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(strata_forward_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(strata_forward_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(strata_forward_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "id": 30,
+      "title": "WAL & Checkpoints",
+      "type": "row"
+    },
+    {
+      "id": 31,
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 24 },
+      "type": "timeseries",
+      "title": "WAL Upload Rate",
+      "description": "WAL segments uploaded to S3 per minute.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(strata_wal_uploads_total{job=\"$job\", instance=~\"$instance\"}[2m])) * 60",
+          "legendFormat": "uploads/min",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean"], "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "blue" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 32,
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 24 },
+      "type": "timeseries",
+      "title": "WAL Upload Errors",
+      "description": "Failed WAL segment uploads. Should be 0.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(strata_wal_upload_errors_total{job=\"$job\", instance=~\"$instance\"}[2m])) * 60",
+          "legendFormat": "errors/min",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "red" },
+          "custom": { "lineWidth": 2, "fillOpacity": 20 },
+          "unit": "short",
+          "min": 0
+        }
+      }
+    },
+    {
+      "id": 33,
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 24 },
+      "type": "timeseries",
+      "title": "WAL Upload Duration (p50 / p95 / p99)",
+      "description": "Time to upload a WAL segment to S3.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(strata_wal_upload_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(strata_wal_upload_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(strata_wal_upload_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 34,
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 24 },
+      "type": "timeseries",
+      "title": "Checkpoints Written",
+      "description": "Leader checkpoints written to S3 (cumulative and rate).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(strata_checkpoints_total{job=\"$job\", instance=~\"$instance\"}[5m])) * 3600",
+          "legendFormat": "checkpoints/hr",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean"], "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "purple" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "id": 40,
+      "title": "Object Store (S3)",
+      "type": "row"
+    },
+    {
+      "id": 41,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 33 },
+      "type": "timeseries",
+      "title": "S3 Operation Rate",
+      "description": "Object store operations per second by op type.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (op) (rate(strata_object_store_ops_total{job=\"$job\", instance=~\"$instance\", result=\"success\"}[2m]))",
+          "legendFormat": "{{op}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "id": 42,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 33 },
+      "type": "timeseries",
+      "title": "S3 Error Rate",
+      "description": "Object store errors as a fraction of total S3 operations, by op type.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (op) (rate(strata_object_store_ops_total{job=\"$job\", instance=~\"$instance\", result=\"error\"}[2m]))\n/ sum by (op) (rate(strata_object_store_ops_total{job=\"$job\", instance=~\"$instance\"}[2m]))",
+          "legendFormat": "{{op}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red",   "value": 0.01 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 43,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 33 },
+      "type": "timeseries",
+      "title": "S3 Latency (p50 / p95 / p99)",
+      "description": "Object store operation latency percentiles (all ops combined).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(strata_object_store_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(strata_object_store_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(strata_object_store_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "s"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "p99" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+        ]
+      }
+    }
+  ]
+}
