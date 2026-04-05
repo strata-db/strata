@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1030,4 +1031,302 @@ func TestLocalWALUploadedOnLeaderElection(t *testing.T) {
 			t.Errorf("phase-3 Get k%d: err=%v kv=%v", i, err, kv)
 		}
 	}
+}
+
+// ── blockableProxy ────────────────────────────────────────────────────────────
+
+// blockableProxy is a TCP proxy that can be paused to simulate a network
+// partition. All connections are forwarded transparently to target; calling
+// block() closes existing connections and refuses new ones until unblock().
+type blockableProxy struct {
+	lis     net.Listener
+	target  string
+	blocked int32 // atomic bool: 1 = drop connections, 0 = forward
+	connsMu sync.Mutex
+	conns   []net.Conn
+}
+
+func newBlockableProxy(t testing.TB, target string) *blockableProxy {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("blockableProxy: listen: %v", err)
+	}
+	p := &blockableProxy{lis: lis, target: target}
+	go p.serve()
+	t.Cleanup(func() { lis.Close() })
+	return p
+}
+
+func (p *blockableProxy) Addr() string { return p.lis.Addr().String() }
+
+// block closes all active connections and causes new ones to be refused
+// immediately until unblock() is called.
+func (p *blockableProxy) block() {
+	atomic.StoreInt32(&p.blocked, 1)
+	p.connsMu.Lock()
+	for _, c := range p.conns {
+		c.Close()
+	}
+	p.conns = p.conns[:0]
+	p.connsMu.Unlock()
+}
+
+func (p *blockableProxy) unblock() { atomic.StoreInt32(&p.blocked, 0) }
+
+func (p *blockableProxy) serve() {
+	for {
+		c, err := p.lis.Accept()
+		if err != nil {
+			return // listener closed (test cleanup)
+		}
+		if atomic.LoadInt32(&p.blocked) == 1 {
+			c.Close()
+			continue
+		}
+		dst, err := net.Dial("tcp", p.target)
+		if err != nil {
+			c.Close()
+			continue
+		}
+		p.connsMu.Lock()
+		p.conns = append(p.conns, c, dst)
+		p.connsMu.Unlock()
+		go func() { io.Copy(dst, c); dst.Close(); c.Close() }()
+		go func() { io.Copy(c, dst); c.Close(); dst.Close() }()
+	}
+}
+
+// ── TestFollowerKilledDuringCommit ────────────────────────────────────────────
+
+// TestFollowerKilledDuringCommit verifies that the leader and remaining
+// follower continue accepting writes after one follower is killed mid-stream,
+// and that the killed follower resyncs correctly when it rejoins with a fresh
+// data directory (bootstrap from S3 checkpoint + WAL replay + live stream).
+func TestFollowerKilledDuringCommit(t *testing.T) {
+	store := object.NewMem()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	nodes := openCluster(t, 3, store)
+	leader := waitForLeaderNode(t, nodes, 10*time.Second)
+	leaderIdx := -1
+	for i, n := range nodes {
+		if n == leader {
+			leaderIdx = i
+			break
+		}
+	}
+	t.Logf("leader: node-%d", leaderIdx)
+
+	// Phase 1: write initial batch and wait for full replication.
+	const phase1 = 10
+	var lastRev int64
+	for i := 0; i < phase1; i++ {
+		rev, err := leader.Put(ctx, fmt.Sprintf("/kill/%d", i), []byte("before"), 0)
+		if err != nil {
+			t.Fatalf("phase1 Put: %v", err)
+		}
+		lastRev = rev
+	}
+	for i, n := range nodes {
+		if n == leader {
+			continue
+		}
+		if err := n.WaitForRevision(ctx, lastRev); err != nil {
+			t.Fatalf("node-%d WaitForRevision phase1: %v", i, err)
+		}
+	}
+
+	// Kill one follower.
+	var victimIdx int
+	for i, n := range nodes {
+		if n != leader {
+			t.Logf("killing follower node-%d", i)
+			victimIdx = i
+			n.Close()
+			break
+		}
+	}
+
+	// Phase 2: continue writing while only leader + 1 follower remain.
+	// WaitForFollowers with 1 connected follower requires 1 ACK (quorum),
+	// so writes proceed normally.
+	const phase2 = 10
+	for i := phase1; i < phase1+phase2; i++ {
+		rev, err := leader.Put(ctx, fmt.Sprintf("/kill/%d", i), []byte("after"), 0)
+		if err != nil {
+			t.Fatalf("phase2 Put after killing follower node-%d: %v", victimIdx, err)
+		}
+		lastRev = rev
+	}
+	t.Logf("phase2 complete: wrote %d keys with follower node-%d down", phase2, victimIdx)
+
+	// Let checkpoint and WAL segments flush to the object store.
+	time.Sleep(1500 * time.Millisecond)
+
+	// Restart the killed follower with a fresh data dir so it must bootstrap
+	// entirely from S3 (checkpoint restore + WAL replay), then catch up via
+	// the live peer stream from the leader.
+	rejoinPeer := freeAddrImpl(t)
+	rejoined, err := strata.Open(strata.Config{
+		DataDir:            t.TempDir(),
+		ObjectStore:        store,
+		NodeID:             fmt.Sprintf("node-%d", victimIdx),
+		PeerListenAddr:     rejoinPeer,
+		AdvertisePeerAddr:  rejoinPeer,
+		FollowerMaxRetries: 2,
+		PeerBufferSize:     1000,
+		CheckpointInterval: 300 * time.Millisecond,
+		SegmentMaxAge:      200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("rejoin open: %v", err)
+	}
+	t.Cleanup(func() { rejoined.Close() })
+
+	if err := rejoined.WaitForRevision(ctx, lastRev); err != nil {
+		t.Fatalf("rejoined WaitForRevision(%d): %v", lastRev, err)
+	}
+
+	// All keys from both phases must be present on the rejoined node.
+	for i := 0; i < phase1+phase2; i++ {
+		kv, err := rejoined.Get(fmt.Sprintf("/kill/%d", i))
+		if err != nil || kv == nil {
+			t.Errorf("rejoined: /kill/%d missing: err=%v kv=%v", i, err, kv)
+		}
+	}
+	t.Logf("rejoined node has all %d keys", phase1+phase2)
+}
+
+// ── TestNetworkPartitionNoSplitBrain ─────────────────────────────────────────
+
+// TestNetworkPartitionNoSplitBrain verifies two properties of partition handling:
+//
+//  1. No split-brain: a follower partitioned from the leader does NOT promote
+//     itself while the leader is alive. The leader keeps LastSeenNano fresh
+//     in the S3 lock every FollowerRetryInterval (2 s); the follower reads
+//     this and backs off from TakeOver because the lock age < LeaderLivenessTTL
+//     (6 s).
+//
+//  2. Convergence on heal: when the partition is removed the follower reconnects
+//     through the proxy, resyncs from the leader, and converges on all keys.
+//
+// A blockableProxy sits between the follower and the leader's peer port so the
+// partition can be injected and healed without killing either process.
+func TestNetworkPartitionNoSplitBrain(t *testing.T) {
+	store := object.NewMem()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	// Allocate the leader's real peer address and wrap it in a blockable proxy.
+	// The leader advertises the proxy address so the follower dials through it.
+	leaderPeerReal := freeAddrImpl(t)
+	proxy := newBlockableProxy(t, leaderPeerReal)
+
+	leaderNode, err := strata.Open(strata.Config{
+		DataDir:            t.TempDir(),
+		ObjectStore:        store,
+		NodeID:             "leader",
+		PeerListenAddr:     leaderPeerReal,
+		AdvertisePeerAddr:  proxy.Addr(), // follower connects through proxy
+		FollowerMaxRetries: 2,
+		PeerBufferSize:     1000,
+		CheckpointInterval: 300 * time.Millisecond,
+		SegmentMaxAge:      200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("open leader: %v", err)
+	}
+	t.Cleanup(func() { leaderNode.Close() })
+
+	// Wait for this node to hold the S3 leader lock before starting the follower,
+	// preventing a race where the follower wins the election instead.
+	deadline := time.Now().Add(10 * time.Second)
+	for !leaderNode.IsLeader() {
+		if time.Now().After(deadline) {
+			t.Fatal("leader node did not acquire lock within timeout")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	followerPeer := freeAddrImpl(t)
+	followerNode, err := strata.Open(strata.Config{
+		DataDir:            t.TempDir(),
+		ObjectStore:        store,
+		NodeID:             "follower",
+		PeerListenAddr:     followerPeer,
+		AdvertisePeerAddr:  followerPeer,
+		FollowerMaxRetries: 2,
+		PeerBufferSize:     1000,
+		CheckpointInterval: 300 * time.Millisecond,
+		SegmentMaxAge:      200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("open follower: %v", err)
+	}
+	t.Cleanup(func() { followerNode.Close() })
+
+	// Phase 1: write and verify replication to confirm the follower is connected.
+	const phase1 = 10
+	var lastRev int64
+	for i := 0; i < phase1; i++ {
+		rev, err := leaderNode.Put(ctx, fmt.Sprintf("/partition/%d", i), []byte("before"), 0)
+		if err != nil {
+			t.Fatalf("phase1 Put: %v", err)
+		}
+		lastRev = rev
+	}
+	if err := followerNode.WaitForRevision(ctx, lastRev); err != nil {
+		t.Fatalf("follower WaitForRevision phase1: %v", err)
+	}
+	t.Logf("phase1 complete: follower at rev=%d", lastRev)
+
+	// Inject partition: follower can no longer reach the leader's peer port.
+	t.Log("blocking proxy — simulating network partition")
+	proxy.block()
+
+	// Wait long enough for the follower to exhaust FollowerMaxRetries (2 × 2 s =
+	// 4 s), attempt TakeOver, see a fresh lock, and back off. We wait 10 s to
+	// cover multiple full retry+takeover cycles, ensuring the behaviour is stable
+	// and not just a transient timing window.
+	time.Sleep(10 * time.Second)
+
+	// ── split-brain check ─────────────────────────────────────────────────────
+	if followerNode.IsLeader() {
+		t.Error("SPLIT-BRAIN: follower promoted itself while real leader is alive")
+	}
+	if !leaderNode.IsLeader() {
+		t.Error("original leader unexpectedly lost leadership during partition")
+	}
+
+	// Phase 2: leader accepts writes while the follower is partitioned.
+	// WaitForFollowers with 0 connected followers returns immediately
+	// (quorum of 0 = 0 ACKs required), so the leader continues.
+	const phase2 = 5
+	for i := phase1; i < phase1+phase2; i++ {
+		rev, err := leaderNode.Put(ctx, fmt.Sprintf("/partition/%d", i), []byte("during-partition"), 0)
+		if err != nil {
+			t.Fatalf("phase2 Put during partition: %v", err)
+		}
+		lastRev = rev
+	}
+	t.Logf("phase2 complete: leader at rev=%d during partition", lastRev)
+
+	// Heal the partition.
+	t.Log("unblocking proxy — healing partition")
+	proxy.unblock()
+
+	// Follower must reconnect through the proxy and resync to the current revision.
+	if err := followerNode.WaitForRevision(ctx, lastRev); err != nil {
+		t.Fatalf("follower WaitForRevision after partition heal: %v", err)
+	}
+
+	// All keys from both phases must be visible on the follower.
+	for i := 0; i < phase1+phase2; i++ {
+		kv, err := followerNode.Get(fmt.Sprintf("/partition/%d", i))
+		if err != nil || kv == nil {
+			t.Errorf("follower: /partition/%d missing after heal: err=%v kv=%v", i, err, kv)
+		}
+	}
+	t.Logf("partition healed: follower converged on all %d keys", phase1+phase2)
 }
