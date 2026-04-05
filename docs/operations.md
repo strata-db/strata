@@ -434,7 +434,54 @@ Steps 4–5 ensure that no committed write is lost even if the node is killed be
 
 ### S3 unavailability
 
-In cluster mode, S3 uploads are fully async — WAL segments and checkpoints are uploaded in the background without blocking writes. In single-node mode, each WAL segment is uploaded to S3 synchronously before the write is acknowledged. In both modes, on restart local WAL segments are replayed first, so no data written to the local WAL is lost even if it was never uploaded to S3.
+**Cluster mode**
+
+In cluster mode, S3 uploads are fully async — WAL segments and checkpoints are uploaded in the background without blocking writes. If S3 becomes unavailable:
+
+- **Writes continue.** Durability is backed by the peer WAL + quorum ACK across nodes, not by S3.
+- **WAL uploads queue.** Failed uploads are retried; a backlog of unsealed segments accumulates in `<data-dir>/wal/`.
+- **Leader election is unaffected** as long as the existing lock record is still readable from S3. If the lock expires or cannot be read, election is blocked until S3 is reachable again.
+- **No committed write is lost.** On restart, local WAL segments are replayed before any S3 reads (step 4 of the recovery procedure). Data that was fsynced to local disk is safe regardless of S3 state.
+
+**Single-node mode**
+
+In single-node mode, each WAL segment is uploaded to S3 synchronously before the write is acknowledged. If S3 becomes unavailable:
+
+- **Writes fail** once the in-progress WAL segment fills and a rotation is attempted. The node fences itself to prevent unacknowledged data from accumulating silently.
+- **Already-acknowledged writes are safe.** All segments uploaded before the outage are on S3; the current open segment is on local disk.
+- **To recover:** repair S3 access and restart the node. On startup it replays all local WAL segments (including any partial segment left on disk), then resumes normal operation.
+
+**After any S3 outage — what is safe**
+
+On startup, Strata replays local WAL segments (step 4) before reading from S3, so no write that was fsynced to local disk is lost even if the segment was never uploaded. In cluster mode with multiple survivors, any write that completed quorum ACK across nodes is never lost even if all S3 state is gone.
+
+---
+
+### Network partitions (cluster mode)
+
+Strata uses S3 as the split-brain arbiter. The leader continuously refreshes a `LastSeenNano` timestamp in the S3 leader lock every `FollowerRetryInterval` (2 s) while followers are disconnected. A follower only promotes itself if it cannot reach the leader **and** the lock is older than `LeaderLivenessTTL` (6 s).
+
+**Follower partitioned from leader, leader can still reach S3:**
+
+1. Follower loses the peer stream; leader detects the disconnect.
+2. Leader immediately touches `LastSeenNano` in the lock, then continues refreshing every 2 s.
+3. Follower exhausts `--follower-max-retries` reconnect attempts (~4 s at the default of 2 × 2 s).
+4. Follower reads the S3 lock — `LastSeenNano` is ≤ 2 s old → backs off, **does not promote**.
+5. Follower keeps retrying the peer connection; leader keeps writing.
+6. When the partition heals the follower reconnects and resyncs. **No split-brain. No data loss.**
+
+**Leader partitioned from S3 (and from followers):**
+
+1. Leader can no longer touch `LastSeenNano`.
+2. After `LeaderLivenessTTL` (6 s) the lock goes stale.
+3. A follower that has been retrying attempts a conditional PUT (`If-Match: <etag>`) on the lock — only one candidate wins this atomic race.
+4. New leader begins streaming WAL entries.
+5. Former leader detects the superseded lock on its next fenced check and steps down.
+6. Any write that completed quorum ACK before the partition exists on at least two nodes' WALs and is **never lost**.
+
+**Writes during a follower partition:**
+
+While followers are disconnected, the leader's `WaitForFollowers` returns immediately (0 connected followers → 0 ACKs required). Writes proceed but are acknowledged only by the leader node. WAL segments continue to be uploaded to S3 asynchronously. If the leader fails while the partition persists and before the segments reach S3, those post-partition writes may be lost. For the highest write durability during a known partition, avoid acknowledging client writes until the partition heals, or use a 3-node cluster so quorum (2 of 3) can still be reached with one node partitioned.
 
 ---
 
