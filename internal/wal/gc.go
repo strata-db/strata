@@ -37,20 +37,25 @@ func GCSegments(ctx context.Context, store object.Store, checkpointRev int64) (i
 		firstRevs[i] = parseFirstRev(k)
 	}
 
-	var deleted int
+	var toDelete []string
 	for i := 0; i < len(keys)-1; i++ {
 		nextFirstRev := firstRevs[i+1]
 		// Segment i ends at nextFirstRev-1; safe to delete if that is <= checkpointRev.
 		if nextFirstRev-1 <= checkpointRev {
-			if err := store.Delete(ctx, keys[i]); err != nil {
-				logrus.Warnf("wal gc: delete %q: %v", keys[i], err)
-				continue
-			}
-			deleted++
-			logrus.Debugf("wal gc: deleted %q (covered by checkpoint rev=%d)", keys[i], checkpointRev)
+			toDelete = append(toDelete, keys[i])
 		}
 	}
-	return deleted, nil
+	if len(toDelete) == 0 {
+		return 0, nil
+	}
+	if err := store.DeleteMany(ctx, toDelete); err != nil {
+		logrus.Warnf("wal gc: delete: %v", err)
+		return 0, nil
+	}
+	for _, k := range toDelete {
+		logrus.Debugf("wal gc: deleted %q (covered by checkpoint rev=%d)", k, checkpointRev)
+	}
+	return len(toDelete), nil
 }
 
 // parseFirstRev extracts the firstRev integer from a WAL object key of the

@@ -418,7 +418,7 @@ The two object-store metrics cover all S3 operations (WAL upload, checkpoint wri
 | `strata_object_store_ops_total` | counter | `op`, `result` | S3 operations by type and outcome (`success`/`error`) |
 | `strata_object_store_duration_seconds` | histogram | `op` | S3 operation latency |
 
-`op` label values for object store: `get`, `put`, `delete`, `list`, `get_etag`, `put_if_absent`, `put_if_match`.
+`op` label values for object store: `get`, `put`, `delete`, `delete_many`, `list`, `get_etag`, `put_if_absent`, `put_if_match`.
 
 ### Alerting
 

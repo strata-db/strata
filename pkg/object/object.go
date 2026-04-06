@@ -28,6 +28,12 @@ type Store interface {
 	// Delete removes the object at key. Not an error if it doesn't exist.
 	Delete(ctx context.Context, key string) error
 
+	// DeleteMany removes multiple objects in a single batched request where
+	// possible. Not an error if individual keys do not exist. Callers should
+	// prefer DeleteMany over repeated Delete calls when deleting more than one
+	// object.
+	DeleteMany(ctx context.Context, keys []string) error
+
 	// List returns keys that share the given prefix, in lexicographic order.
 	List(ctx context.Context, prefix string) ([]string, error)
 }

@@ -62,6 +62,13 @@ func (s *instrumentedStore) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+func (s *instrumentedStore) DeleteMany(ctx context.Context, keys []string) error {
+	start := time.Now()
+	err := s.inner.DeleteMany(ctx, keys)
+	record("delete_many", start, err)
+	return err
+}
+
 func (s *instrumentedStore) List(ctx context.Context, prefix string) ([]string, error) {
 	start := time.Now()
 	keys, err := s.inner.List(ctx, prefix)

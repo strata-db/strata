@@ -616,12 +616,7 @@ func deleteCheckpoint(ctx context.Context, store object.Store, key string) error
 	if err != nil {
 		return err
 	}
-	for _, sk := range subkeys {
-		if err := store.Delete(ctx, sk); err != nil {
-			return err
-		}
-	}
-	return nil
+	return store.DeleteMany(ctx, subkeys)
 }
 
 // GCOrphanSSTs deletes SST files that were exclusively referenced by deleted
@@ -634,12 +629,15 @@ func deleteCheckpoint(ctx context.Context, store object.Store, key string) error
 // uploads SSTs before writing its first checkpoint: those SSTs would appear as
 // "orphans" in a full-LIST approach even though they are about to be referenced.
 func GCOrphanSSTs(ctx context.Context, store object.Store, candidates map[string]struct{}) (int, error) {
-	var deleted int
-	for k := range candidates {
-		if err := store.Delete(ctx, k); err != nil {
-			return deleted, fmt.Errorf("checkpoint gc ssts: delete %q: %w", k, err)
-		}
-		deleted++
+	if len(candidates) == 0 {
+		return 0, nil
 	}
-	return deleted, nil
+	keys := make([]string, 0, len(candidates))
+	for k := range candidates {
+		keys = append(keys, k)
+	}
+	if err := store.DeleteMany(ctx, keys); err != nil {
+		return 0, fmt.Errorf("checkpoint gc ssts: %w", err)
+	}
+	return len(keys), nil
 }
