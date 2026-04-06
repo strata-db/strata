@@ -54,6 +54,19 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 		switch v := req.RequestUnion.(type) {
 		case *etcdserverpb.WatchRequest_CreateRequest:
 			cr := v.CreateRequest
+			if isInternalKey(string(cr.Key)) {
+				select {
+				case sendCh <- &etcdserverpb.WatchResponse{
+					Header:       s.header(),
+					WatchId:      -1,
+					Canceled:     true,
+					CancelReason: "reserved internal prefix is not watchable",
+				}:
+				case <-ctx.Done():
+					goto done
+				}
+				continue
+			}
 			id := nextID
 			nextID++
 
@@ -93,6 +106,10 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 					return
 				}
 				for e := range events {
+					e, ok := userEvent(e)
+					if !ok {
+						continue
+					}
 					resp := &etcdserverpb.WatchResponse{
 						Header:  s.header(),
 						WatchId: watchID,

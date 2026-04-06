@@ -10,6 +10,7 @@ package etcd
 
 import (
 	"context"
+	"sync"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -26,16 +27,19 @@ import (
 
 // Server implements the etcd v3 gRPC protocol on top of a strata Node.
 type Server struct {
-	node      *strata.Node
-	authStore *auth.Store
-	tokens    *auth.TokenStore
+	node          *strata.Node
+	authStore     *auth.Store
+	tokens        *auth.TokenStore
+	leaseLoopOnce sync.Once
 }
 
 // New returns a Server backed by node. When authStore and tokens are non-nil,
 // the Auth gRPC service is registered and RBAC is enforced on all KV/Watch
 // calls.
 func New(node *strata.Node, authStore *auth.Store, tokens *auth.TokenStore) *Server {
-	return &Server{node: node, authStore: authStore, tokens: tokens}
+	s := &Server{node: node, authStore: authStore, tokens: tokens}
+	s.maybeStartLeaseLoop()
+	return s
 }
 
 // NewServerOptions returns the gRPC server options required for auth
