@@ -10,6 +10,7 @@ package etcd
 
 import (
 	"context"
+	"sync"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -26,16 +27,19 @@ import (
 
 // Server implements the etcd v3 gRPC protocol on top of a strata Node.
 type Server struct {
-	node      *strata.Node
-	authStore *auth.Store
-	tokens    *auth.TokenStore
+	node          *strata.Node
+	authStore     *auth.Store
+	tokens        *auth.TokenStore
+	leaseLoopOnce sync.Once
 }
 
 // New returns a Server backed by node. When authStore and tokens are non-nil,
 // the Auth gRPC service is registered and RBAC is enforced on all KV/Watch
 // calls.
 func New(node *strata.Node, authStore *auth.Store, tokens *auth.TokenStore) *Server {
-	return &Server{node: node, authStore: authStore, tokens: tokens}
+	s := &Server{node: node, authStore: authStore, tokens: tokens}
+	s.maybeStartLeaseLoop()
+	return s
 }
 
 // NewServerOptions returns the gRPC server options required for auth
@@ -140,16 +144,13 @@ func (s *Server) MemberPromote(_ context.Context, _ *etcdserverpb.MemberPromoteR
 // ── Maintenance (stubs) ──────────────────────────────────────────────────────
 
 func (s *Server) Alarm(_ context.Context, _ *etcdserverpb.AlarmRequest) (*etcdserverpb.AlarmResponse, error) {
-	return &etcdserverpb.AlarmResponse{Header: s.header()}, nil
+	return nil, unimplemented()
 }
 func (s *Server) Status(_ context.Context, _ *etcdserverpb.StatusRequest) (*etcdserverpb.StatusResponse, error) {
-	return &etcdserverpb.StatusResponse{
-		Header:  s.header(),
-		Version: "3.5.0",
-	}, nil
+	return nil, unimplemented()
 }
 func (s *Server) Defragment(_ context.Context, _ *etcdserverpb.DefragmentRequest) (*etcdserverpb.DefragmentResponse, error) {
-	return &etcdserverpb.DefragmentResponse{Header: s.header()}, nil
+	return nil, unimplemented()
 }
 func (s *Server) Hash(_ context.Context, _ *etcdserverpb.HashRequest) (*etcdserverpb.HashResponse, error) {
 	return nil, unimplemented()

@@ -6,12 +6,13 @@ package etcd_test
 // Unsupported / out-of-scope features that are intentionally skipped:
 //   - Historical Gets with WithRev (point-in-time reads)
 //   - Range deletes (WithPrefix / WithFromKey on Delete)
-//   - Leases, auth, member API, progress notifications
+//   - Auth, member API, progress notifications
 //
 // Watch compaction tests live in watch_test.go (TestWatchKubeLikeCompactionRecovery).
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -398,37 +399,167 @@ func TestCompatTxnCAS(t *testing.T) {
 	}
 }
 
-// TestCompatTxnMultipleOps verifies that an unconditional Txn (no If) can
-// batch multiple Put operations atomically. Conditional multi-op transactions
-// are not supported by strata's etcd adapter.
+// TestCompatTxnMultipleOps verifies that unconditional multi-op transactions
+// fail closed until true etcd txn semantics are implemented.
 func TestCompatTxnMultipleOps(t *testing.T) {
 	_, cli := newCompatNode(t)
 	ctx := context.Background()
 
-	// No condition → Success ops run unconditionally.
-	txnResp, err := cli.Txn(ctx).
+	_, err := cli.Txn(ctx).
 		Then(
 			clientv3.OpPut("/compat/txn/multi/a", "va"),
 			clientv3.OpPut("/compat/txn/multi/b", "vb"),
 			clientv3.OpPut("/compat/txn/multi/c", "vc"),
 		).
 		Commit()
+	if err == nil {
+		t.Fatal("Txn multi-op: expected error")
+	}
+	if !strings.Contains(err.Error(), "transactions without compares are not supported") {
+		t.Fatalf("Txn multi-op: unexpected error: %v", err)
+	}
+}
+
+// ── Leases ───────────────────────────────────────────────────────────────────
+
+func TestCompatLeaseGrantAttachTTL(t *testing.T) {
+	_, cli := newCompatNode(t)
+	ctx := context.Background()
+
+	lease, err := cli.Grant(ctx, 5)
 	if err != nil {
-		t.Fatalf("Txn multi-op: %v", err)
+		t.Fatalf("Grant: %v", err)
 	}
-	if !txnResp.Succeeded {
-		t.Error("Txn multi-op: want Succeeded=true")
-	}
-	if len(txnResp.Responses) != 3 {
-		t.Errorf("Txn multi-op: want 3 responses, got %d", len(txnResp.Responses))
+	if _, err := cli.Put(ctx, "/compat/lease/k", "v", clientv3.WithLease(lease.ID)); err != nil {
+		t.Fatalf("Put with lease: %v", err)
 	}
 
-	resp, err := cli.Get(ctx, "/compat/txn/multi/", clientv3.WithPrefix())
+	resp, err := cli.TimeToLive(ctx, lease.ID, clientv3.WithAttachedKeys())
 	if err != nil {
-		t.Fatalf("Get after multi-op txn: %v", err)
+		t.Fatalf("TimeToLive: %v", err)
 	}
-	if len(resp.Kvs) != 3 {
-		t.Errorf("after multi-op txn: want 3 keys, got %d", len(resp.Kvs))
+	if resp.ID != lease.ID {
+		t.Fatalf("TimeToLive ID: want %d got %d", lease.ID, resp.ID)
+	}
+	if resp.GrantedTTL != 5 {
+		t.Fatalf("TimeToLive GrantedTTL: want 5 got %d", resp.GrantedTTL)
+	}
+	if resp.TTL < 1 || resp.TTL > 5 {
+		t.Fatalf("TimeToLive TTL: want 1..5 got %d", resp.TTL)
+	}
+	if len(resp.Keys) != 1 || string(resp.Keys[0]) != "/compat/lease/k" {
+		t.Fatalf("TimeToLive Keys: got %q", resp.Keys)
+	}
+
+	getResp, err := cli.Get(ctx, "", clientv3.WithFromKey())
+	if err != nil {
+		t.Fatalf("Get all keys: %v", err)
+	}
+	for _, kv := range getResp.Kvs {
+		if strings.HasPrefix(string(kv.Key), "\x00strata/") {
+			t.Fatalf("internal key leaked through etcd API: %q", kv.Key)
+		}
+	}
+}
+
+func TestCompatLeaseKeepAliveAndLeases(t *testing.T) {
+	_, cli := newCompatNode(t)
+	ctx := context.Background()
+
+	lease, err := cli.Grant(ctx, 2)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	time.Sleep(1200 * time.Millisecond)
+
+	ka, err := cli.KeepAliveOnce(ctx, lease.ID)
+	if err != nil {
+		t.Fatalf("KeepAliveOnce: %v", err)
+	}
+	if ka.ID != lease.ID {
+		t.Fatalf("KeepAliveOnce ID: want %d got %d", lease.ID, ka.ID)
+	}
+
+	ttlResp, err := cli.TimeToLive(ctx, lease.ID)
+	if err != nil {
+		t.Fatalf("TimeToLive after keepalive: %v", err)
+	}
+	if ttlResp.TTL < 1 {
+		t.Fatalf("TimeToLive after keepalive: want positive TTL got %d", ttlResp.TTL)
+	}
+
+	leases, err := cli.Leases(ctx)
+	if err != nil {
+		t.Fatalf("Leases: %v", err)
+	}
+	found := false
+	for _, ls := range leases.Leases {
+		if ls.ID == lease.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Leases: missing lease %d", lease.ID)
+	}
+}
+
+func TestCompatLeaseRevokeDeletesKeys(t *testing.T) {
+	_, cli := newCompatNode(t)
+	ctx := context.Background()
+
+	lease, err := cli.Grant(ctx, 10)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	if _, err := cli.Put(ctx, "/compat/lease/revoke", "v", clientv3.WithLease(lease.ID)); err != nil {
+		t.Fatalf("Put with lease: %v", err)
+	}
+	if _, err := cli.Revoke(ctx, lease.ID); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+
+	resp, err := cli.Get(ctx, "/compat/lease/revoke")
+	if err != nil {
+		t.Fatalf("Get after revoke: %v", err)
+	}
+	if len(resp.Kvs) != 0 {
+		t.Fatalf("expected key deletion on revoke, got %d keys", len(resp.Kvs))
+	}
+	if _, err := cli.TimeToLive(ctx, lease.ID); err == nil {
+		t.Fatal("expected TimeToLive on revoked lease to fail")
+	}
+}
+
+func TestCompatLeaseExpiryDeletesKeys(t *testing.T) {
+	_, cli := newCompatNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	lease, err := cli.Grant(ctx, 1)
+	if err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	if _, err := cli.Put(ctx, "/compat/lease/expire", "v", clientv3.WithLease(lease.ID)); err != nil {
+		t.Fatalf("Put with lease: %v", err)
+	}
+
+	for {
+		resp, err := cli.Get(ctx, "/compat/lease/expire")
+		if err != nil {
+			t.Fatalf("Get after expiry: %v", err)
+		}
+		if len(resp.Kvs) == 0 {
+			break
+		}
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatal("timeout waiting for lease expiry deletion")
+		}
+	}
+	if _, err := cli.TimeToLive(ctx, lease.ID); err == nil {
+		t.Fatal("expected expired lease to disappear")
 	}
 }
 

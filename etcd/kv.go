@@ -23,6 +23,9 @@ func (s *Server) Range(ctx context.Context, r *etcdserverpb.RangeRequest) (*etcd
 
 	// Single-key lookup.
 	if rangeEnd == "" {
+		if isInternalKey(key) {
+			return &etcdserverpb.RangeResponse{Header: s.header()}, nil
+		}
 		if r.CountOnly {
 			var (
 				kv  *strata.KeyValue
@@ -71,16 +74,24 @@ func (s *Server) Range(ctx context.Context, r *etcdserverpb.RangeRequest) (*etcd
 
 	if r.CountOnly {
 		var (
-			count int64
-			err   error
+			all []*strata.KeyValue
+			err error
 		)
 		if linearizable {
-			count, err = s.node.LinearizableCount(ctx, prefix)
+			all, err = s.node.LinearizableList(ctx, prefix)
 		} else {
-			count, err = s.node.Count(prefix)
+			all, err = s.node.List(prefix)
 		}
 		if err != nil {
 			return nil, err
+		}
+		all = userKeyValues(all)
+		var count int64
+		for _, kv := range all {
+			if rangeEnd != "\x00" && kv.Key >= rangeEnd {
+				continue
+			}
+			count++
 		}
 		return &etcdserverpb.RangeResponse{Header: s.header(), Count: count}, nil
 	}
@@ -97,6 +108,7 @@ func (s *Server) Range(ctx context.Context, r *etcdserverpb.RangeRequest) (*etcd
 	if err != nil {
 		return nil, err
 	}
+	all = userKeyValues(all)
 
 	var kvs []*mvccpb.KeyValue
 	for _, kv := range all {
@@ -120,6 +132,14 @@ func (s *Server) Range(ctx context.Context, r *etcdserverpb.RangeRequest) (*etcd
 // Put implements KVServer.Put.
 func (s *Server) Put(ctx context.Context, r *etcdserverpb.PutRequest) (*etcdserverpb.PutResponse, error) {
 	key := string(r.Key)
+	if err := validateUserKey(key); err != nil {
+		return nil, err
+	}
+	if r.Lease != 0 {
+		if _, err := s.getLease(ctx, r.Lease, true); err != nil {
+			return nil, err
+		}
+	}
 	resp := &etcdserverpb.PutResponse{Header: s.header()}
 
 	if r.PrevKv {
@@ -146,6 +166,9 @@ func (s *Server) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeReq
 		return nil, status.Error(codes.Unimplemented, "range deletes not supported")
 	}
 	key := string(r.Key)
+	if err := validateUserKey(key); err != nil {
+		return nil, err
+	}
 	resp := &etcdserverpb.DeleteRangeResponse{Header: s.header()}
 
 	if r.PrevKv {
@@ -172,22 +195,12 @@ func (s *Server) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeReq
 // Txn implements KVServer.Txn.
 //
 // Supported patterns:
-//   - No compare: execute Success ops unconditionally.
 //   - Single compare on MOD == 0 or VERSION == 0: create-if-not-exists.
 //   - Single compare on MOD == X, Success=Put: compare-and-swap update.
 //   - Single compare on MOD == X, Success=Delete: compare-and-swap delete.
 func (s *Server) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserverpb.TxnResponse, error) {
-	// No compare: run Success ops directly.
 	if len(r.Compare) == 0 {
-		ops, err := s.execOps(ctx, r.Success)
-		if err != nil {
-			return nil, err
-		}
-		return &etcdserverpb.TxnResponse{
-			Header:    s.header(),
-			Succeeded: true,
-			Responses: ops,
-		}, nil
+		return nil, status.Error(codes.Unimplemented, "transactions without compares are not supported")
 	}
 
 	if len(r.Compare) != 1 {
@@ -196,11 +209,22 @@ func (s *Server) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserv
 
 	cmp := r.Compare[0]
 	key := string(cmp.Key)
+	if err := validateUserKey(key); err != nil {
+		return nil, err
+	}
 	putOp := successPut(r)
 	delOp := successDelete(r)
 
 	// Create-if-not-exists: compare MOD==0 or VERSION==0.
 	if isZeroCompare(cmp) && putOp != nil {
+		if err := validateUserKey(string(putOp.Key)); err != nil {
+			return nil, err
+		}
+		if putOp.Lease != 0 {
+			if _, err := s.getLease(ctx, putOp.Lease, true); err != nil {
+				return nil, err
+			}
+		}
 		rev, err := s.node.Create(ctx, string(putOp.Key), putOp.Value, putOp.Lease)
 		if err != nil {
 			if errors.Is(err, strata.ErrKeyExists) {
@@ -215,6 +239,14 @@ func (s *Server) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserv
 
 	// CAS update: compare MOD == X, success = put.
 	if cmp.Target == etcdserverpb.Compare_MOD && cmp.Result == etcdserverpb.Compare_EQUAL && putOp != nil {
+		if err := validateUserKey(string(putOp.Key)); err != nil {
+			return nil, err
+		}
+		if putOp.Lease != 0 {
+			if _, err := s.getLease(ctx, putOp.Lease, true); err != nil {
+				return nil, err
+			}
+		}
 		_, _, ok, err := s.node.Update(ctx, key, putOp.Value, cmp.GetModRevision(), putOp.Lease)
 		if err != nil {
 			return nil, err
@@ -228,6 +260,9 @@ func (s *Server) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserv
 
 	// CAS delete: compare MOD == X, success = delete.
 	if cmp.Target == etcdserverpb.Compare_MOD && cmp.Result == etcdserverpb.Compare_EQUAL && delOp != nil {
+		if err := validateUserKey(string(delOp.Key)); err != nil {
+			return nil, err
+		}
 		_, _, ok, err := s.node.DeleteIfRevision(ctx, key, cmp.GetModRevision())
 		if err != nil {
 			return nil, err
