@@ -15,9 +15,9 @@ spec:
   template:
     metadata:
       annotations:
-        {{- with .Values.podAnnotations }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        {{- $metricsPort := (split ":" .Values.config.metricsAddr)._1 | default "9090" }}
+        {{- $defaultAnnotations := dict "prometheus.io/scrape" "true" "prometheus.io/path" "/metrics" "prometheus.io/port" $metricsPort }}
+        {{- toYaml (merge .Values.podAnnotations $defaultAnnotations) | nindent 8 }}
       labels:
         {{- include "strata.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}

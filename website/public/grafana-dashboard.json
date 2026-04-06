@@ -165,7 +165,7 @@
         "justifyMode": "center",
         "orientation": "vertical",
         "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
-        "textMode": "name"
+        "textMode": "value_and_name"
       },
       "fieldConfig": {
         "defaults": {
