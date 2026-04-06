@@ -103,6 +103,15 @@ func (m *Mem) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+func (m *Mem) DeleteMany(_ context.Context, keys []string) error {
+	m.mu.Lock()
+	for _, k := range keys {
+		delete(m.objects, k)
+	}
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *Mem) List(_ context.Context, prefix string) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

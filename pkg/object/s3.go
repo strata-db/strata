@@ -154,6 +154,49 @@ func (s *S3Store) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
+const deleteObjectsMaxKeys = 1000
+
+func (s *S3Store) DeleteMany(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	var errs []error
+	for len(keys) > 0 {
+		batch := keys
+		if len(batch) > deleteObjectsMaxKeys {
+			batch = keys[:deleteObjectsMaxKeys]
+		}
+		keys = keys[len(batch):]
+
+		objs := make([]types.ObjectIdentifier, len(batch))
+		for i, k := range batch {
+			objs[i] = types.ObjectIdentifier{Key: aws.String(s.key(k))}
+		}
+		out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.bucket),
+			Delete: &types.Delete{
+				Objects: objs,
+				Quiet:   aws.Bool(true), // only report errors, not successes
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("object/s3: delete-many: %w", err)
+		}
+		for _, e := range out.Errors {
+			key := ""
+			if e.Key != nil {
+				key = *e.Key
+			}
+			msg := ""
+			if e.Message != nil {
+				msg = *e.Message
+			}
+			errs = append(errs, fmt.Errorf("object/s3: delete-many %q: %s", key, msg))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (s *S3Store) List(ctx context.Context, prefix string) ([]string, error) {
 	fullPrefix := s.key(prefix)
 	var keys []string

@@ -79,6 +79,13 @@ func (f *faultyStore) Delete(ctx context.Context, key string) error {
 	return f.inner.Delete(ctx, key)
 }
 
+func (f *faultyStore) DeleteMany(ctx context.Context, keys []string) error {
+	if f.isBroken() {
+		return errors.New("faultyStore: DeleteMany: injected failure")
+	}
+	return f.inner.DeleteMany(ctx, keys)
+}
+
 func (f *faultyStore) List(ctx context.Context, prefix string) ([]string, error) {
 	return f.inner.List(ctx, prefix)
 }
@@ -117,6 +124,10 @@ func (t *trackingStore) Get(ctx context.Context, key string) (io.ReadCloser, err
 
 func (t *trackingStore) Delete(ctx context.Context, key string) error {
 	return t.inner.Delete(ctx, key)
+}
+
+func (t *trackingStore) DeleteMany(ctx context.Context, keys []string) error {
+	return t.inner.DeleteMany(ctx, keys)
 }
 
 func (t *trackingStore) List(ctx context.Context, prefix string) ([]string, error) {
