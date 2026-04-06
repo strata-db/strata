@@ -16,17 +16,24 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
 
       - name: Install Helm
         uses: azure/setup-helm@v4
 
-      - name: Extract versions from tag and go.mod/git
+      - name: Extract versions from tag and git
         # Tag format: chart/v1.2.3  →  CHART_VERSION=1.2.3
-        # APP_VERSION is taken from the most recent v* tag on the repo.
+        # APP_VERSION is taken from the most recent v* (app) tag on the repo.
         run: |
           TAG="${GITHUB_REF_NAME}"          # e.g. chart/v0.2.3
           echo "CHART_VERSION=${TAG#chart/v}" >> "$GITHUB_ENV"
-          APP_VERSION=$(git tag --list 'v*' --sort=-version:refname | head -1 | sed 's/^v//')
+          APP_VERSION=$(git tag --list 'v*' --sort=-version:refname | grep -v '^chart/' | head -1 | sed 's/^v//')
+          if [ -z "${APP_VERSION}" ]; then
+            echo "ERROR: no app version tag (v*) found in repository" >&2
+            exit 1
+          fi
           echo "APP_VERSION=${APP_VERSION}" >> "$GITHUB_ENV"
 
       - name: Stamp version into Chart.yaml

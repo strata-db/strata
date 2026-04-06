@@ -16,8 +16,18 @@ spec:
     metadata:
       annotations:
         {{- $metricsPort := (split ":" .Values.config.metricsAddr)._1 | default "9090" }}
-        {{- $defaultAnnotations := dict "prometheus.io/scrape" "true" "prometheus.io/path" "/metrics" "prometheus.io/port" $metricsPort }}
-        {{- toYaml (merge .Values.podAnnotations $defaultAnnotations) | nindent 8 }}
+        {{- if not (hasKey .Values.podAnnotations "prometheus.io/scrape") }}
+        prometheus.io/scrape: "true"
+        {{- end }}
+        {{- if not (hasKey .Values.podAnnotations "prometheus.io/path") }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- if not (hasKey .Values.podAnnotations "prometheus.io/port") }}
+        prometheus.io/port: {{ $metricsPort | quote }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       labels:
         {{- include "strata.selectorLabels" . | nindent 8 }}
         {{- with .Values.podLabels }}
