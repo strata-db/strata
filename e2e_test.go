@@ -374,7 +374,7 @@ func TestRestorePoint(t *testing.T) {
 	// Wait for at least one checkpoint and WAL upload cycle.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		m, _ := checkpoint.ReadManifest(ctx, store)
+		m, _ := checkpoint.New(nil).ReadManifest(ctx, store)
 		if m != nil && store.versionOf(m.CheckpointKey) != "" {
 			break
 		}
@@ -382,7 +382,7 @@ func TestRestorePoint(t *testing.T) {
 	}
 
 	// Capture the restore point: checkpoint archive + all WAL segments so far.
-	manifest, err := checkpoint.ReadManifest(ctx, store)
+	manifest, err := checkpoint.New(nil).ReadManifest(ctx, store)
 	if err != nil || manifest == nil {
 		t.Fatalf("ReadManifest: err=%v manifest=%v", err, manifest)
 	}

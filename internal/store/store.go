@@ -11,9 +11,13 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
-	"github.com/sirupsen/logrus"
 	"github.com/t4db/t4/internal/wal"
 )
+
+// logger is the minimal logging interface required by Store.
+type logger interface {
+	Warnf(format string, args ...interface{})
+}
 
 // ErrClosed is returned by WaitForRevision when the store has been closed.
 var ErrClosed = errors.New("store: closed")
@@ -51,7 +55,7 @@ type PebbleOption = func(*pebble.Options)
 // If the database is locked by another process, Open retries for up to
 // lockRetryTimeout before returning an error. This handles the Kubernetes pod
 // replacement race where the old instance has not yet released the lock.
-func Open(dir string, extraOpts ...func(*pebble.Options)) (*Store, error) {
+func Open(dir string, log logger, extraOpts ...func(*pebble.Options)) (*Store, error) {
 	opts := &pebble.Options{}
 	for _, fn := range extraOpts {
 		fn(opts)
@@ -70,7 +74,7 @@ func Open(dir string, extraOpts ...func(*pebble.Options)) (*Store, error) {
 		if !isPebbleLockError(err) || time.Now().After(deadline) {
 			return nil, fmt.Errorf("store: open pebble %q: %w", dir, err)
 		}
-		logrus.Warnf("t4: pebble locked at %q, retrying in 1s (previous instance still terminating?)", dir)
+		log.Warnf("t4: pebble locked at %q, retrying in 1s (previous instance still terminating?)", dir)
 		time.Sleep(time.Second)
 	}
 }

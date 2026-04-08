@@ -6,8 +6,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sirupsen/logrus"
-
 	"github.com/t4db/t4/pkg/object"
 )
 
@@ -22,7 +20,7 @@ import (
 // retained as it may contain entries after checkpointRev.
 //
 // Returns the number of segments deleted.
-func GCSegments(ctx context.Context, store object.Store, checkpointRev int64) (int, error) {
+func GCSegments(ctx context.Context, store object.Store, checkpointRev int64, log walLogger) (int, error) {
 	keys, err := store.List(ctx, "wal/")
 	if err != nil {
 		return 0, fmt.Errorf("wal gc: list: %w", err)
@@ -49,11 +47,11 @@ func GCSegments(ctx context.Context, store object.Store, checkpointRev int64) (i
 		return 0, nil
 	}
 	if err := store.DeleteMany(ctx, toDelete); err != nil {
-		logrus.Warnf("wal gc: delete: %v", err)
+		log.Warnf("wal gc: delete: %v", err)
 		return 0, nil
 	}
 	for _, k := range toDelete {
-		logrus.Debugf("wal gc: deleted %q (covered by checkpoint rev=%d)", k, checkpointRev)
+		log.Debugf("wal gc: deleted %q (covered by checkpoint rev=%d)", k, checkpointRev)
 	}
 	return len(toDelete), nil
 }

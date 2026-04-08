@@ -22,7 +22,7 @@ type BranchEntry struct {
 
 // RegisterBranch writes a branch registry entry to the source store.
 // Call before starting the branch node to protect source SSTs from GC.
-func RegisterBranch(ctx context.Context, store object.Store, id, ancestorCheckpointKey string) error {
+func (mgr *Manager) RegisterBranch(ctx context.Context, store object.Store, id, ancestorCheckpointKey string) error {
 	entry := BranchEntry{AncestorCheckpointKey: ancestorCheckpointKey}
 	b, err := json.Marshal(entry)
 	if err != nil {
@@ -36,7 +36,7 @@ func RegisterBranch(ctx context.Context, store object.Store, id, ancestorCheckpo
 
 // UnregisterBranch removes the branch registry entry from the source store.
 // Call when the branch is decommissioned and its source SSTs are no longer needed.
-func UnregisterBranch(ctx context.Context, store object.Store, id string) error {
+func (mgr *Manager) UnregisterBranch(ctx context.Context, store object.Store, id string) error {
 	if err := store.Delete(ctx, branchKey(id)); err != nil {
 		return fmt.Errorf("checkpoint: unregister branch %q: %w", id, err)
 	}
@@ -44,7 +44,7 @@ func UnregisterBranch(ctx context.Context, store object.Store, id string) error 
 }
 
 // ReadBranchEntries returns all branch registry entries in the store.
-func ReadBranchEntries(ctx context.Context, store object.Store) (map[string]BranchEntry, error) {
+func (mgr *Manager) ReadBranchEntries(ctx context.Context, store object.Store) (map[string]BranchEntry, error) {
 	keys, err := store.List(ctx, "branches/")
 	if err != nil {
 		return nil, fmt.Errorf("checkpoint: list branches: %w", err)

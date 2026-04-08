@@ -5,7 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -38,14 +37,19 @@ type Client struct {
 
 	connMu sync.Mutex
 	conn   *grpc.ClientConn // lazily initialised; nil after Close
+
+	log peerLogger
 }
 
 // NewClient creates a Client that will connect to leaderAddr.
 // maxRetries is the number of consecutive connection failures before Follow
 // returns ErrLeaderUnreachable. Use 0 for unlimited retries.
 // tlsCreds may be nil for plaintext (only safe on a trusted network).
-func NewClient(leaderAddr, nodeID string, maxRetries int, tlsCreds credentials.TransportCredentials) *Client {
-	return &Client{leaderAddr: leaderAddr, nodeID: nodeID, maxRetries: maxRetries, tlsCreds: tlsCreds}
+func NewClient(leaderAddr, nodeID string, maxRetries int, tlsCreds credentials.TransportCredentials, log peerLogger) *Client {
+	if log == nil {
+		log = stdlibPeerLogger{}
+	}
+	return &Client{leaderAddr: leaderAddr, nodeID: nodeID, maxRetries: maxRetries, tlsCreds: tlsCreds, log: log}
 }
 
 // Close releases the underlying gRPC connection.
@@ -102,12 +106,12 @@ func (c *Client) Follow(ctx context.Context, fromRev int64, walFn func([]wal.Ent
 			return ctx.Err()
 		}
 		if IsResyncRequired(err) {
-			logrus.Errorf("peer: leader requires resync from rev=%d: %v", fromRev, err)
+			c.log.Errorf("peer: leader requires resync from rev=%d: %v", fromRev, err)
 			return err
 		}
 		// Leader is shutting down: skip retry wait and signal caller to elect now.
 		if IsLeaderShutdown(err) {
-			logrus.Infof("peer: leader sent graceful shutdown — starting election immediately")
+			c.log.Infof("peer: leader sent graceful shutdown — starting election immediately")
 			return err
 		}
 
@@ -119,11 +123,11 @@ func (c *Client) Follow(ctx context.Context, fromRev int64, walFn func([]wal.Ent
 		fromRev = nextRev
 
 		if c.maxRetries > 0 && consecutiveFailures >= c.maxRetries {
-			logrus.Errorf("peer: leader unreachable after %d attempts", consecutiveFailures)
+			c.log.Errorf("peer: leader unreachable after %d attempts", consecutiveFailures)
 			return ErrLeaderUnreachable
 		}
 
-		logrus.Warnf("peer: stream error (attempt %d): %v", consecutiveFailures, err)
+		c.log.Warnf("peer: stream error (attempt %d): %v", consecutiveFailures, err)
 		select {
 		case <-time.After(FollowerRetryInterval):
 		case <-ctx.Done():
@@ -155,7 +159,7 @@ func (c *Client) followOnce(ctx context.Context, fromRev int64, walFn func([]wal
 		return fromRev, err
 	}
 
-	logrus.Infof("peer: connected to leader %s (fromRev=%d)", c.leaderAddr, fromRev)
+	c.log.Infof("peer: connected to leader %s (fromRev=%d)", c.leaderAddr, fromRev)
 
 	// entryC buffers entries received from the stream so the main loop can
 	// drain multiple entries per batch, amortising WAL fsyncs (AppendBatch
@@ -229,11 +233,11 @@ func (c *Client) followOnce(ctx context.Context, fromRev int64, walFn func([]wal
 func (c *Client) GoodBye(ctx context.Context) {
 	conn, err := c.getConn()
 	if err != nil {
-		logrus.Warnf("peer: goodbye: connect: %v", err)
+		c.log.Warnf("peer: goodbye: connect: %v", err)
 		return
 	}
 	if _, err := NewWalStreamClient(conn).GoodBye(ctx, &GoodByeRequest{NodeID: c.nodeID}); err != nil {
-		logrus.Warnf("peer: goodbye: rpc: %v", err)
+		c.log.Warnf("peer: goodbye: rpc: %v", err)
 	}
 }
 

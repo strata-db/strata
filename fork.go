@@ -21,14 +21,15 @@ import (
 // Call Fork before starting the branch node. When the branch is decommissioned,
 // call Unfork to allow GC to reclaim the protected SSTs.
 func Fork(ctx context.Context, sourceStore object.Store, branchID string) (checkpointKey string, err error) {
-	manifest, err := checkpoint.ReadManifest(ctx, sourceStore)
+	cp := checkpoint.New(defaultLogger())
+	manifest, err := cp.ReadManifest(ctx, sourceStore)
 	if err != nil {
 		return "", fmt.Errorf("fork: read source manifest: %w", err)
 	}
 	if manifest == nil {
 		return "", fmt.Errorf("fork: no checkpoint found in source store")
 	}
-	if err := checkpoint.RegisterBranch(ctx, sourceStore, branchID, manifest.CheckpointKey); err != nil {
+	if err := cp.RegisterBranch(ctx, sourceStore, branchID, manifest.CheckpointKey); err != nil {
 		return "", fmt.Errorf("fork: register branch: %w", err)
 	}
 	return manifest.CheckpointKey, nil
@@ -38,7 +39,7 @@ func Fork(ctx context.Context, sourceStore object.Store, branchID string) (check
 // branch is decommissioned to allow GC to reclaim SSTs that are no longer
 // referenced by any live checkpoint.
 func Unfork(ctx context.Context, sourceStore object.Store, branchID string) error {
-	if err := checkpoint.UnregisterBranch(ctx, sourceStore, branchID); err != nil {
+	if err := checkpoint.New(defaultLogger()).UnregisterBranch(ctx, sourceStore, branchID); err != nil {
 		return fmt.Errorf("unfork: %w", err)
 	}
 	return nil

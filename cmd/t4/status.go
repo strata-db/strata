@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/t4db/t4/internal/checkpoint"
@@ -28,12 +29,14 @@ This command does not require a running node — it reads directly from S3.`,
 			}
 			ctx := cmd.Context()
 
-			manifest, err := checkpoint.ReadManifest(ctx, store)
+			cp := checkpoint.New(logrus.StandardLogger())
+
+			manifest, err := cp.ReadManifest(ctx, store)
 			if err != nil {
 				return fmt.Errorf("read manifest: %w", err)
 			}
 
-			checkpointKeys, err := checkpoint.ListRemote(ctx, store)
+			checkpointKeys, err := cp.ListRemote(ctx, store)
 			if err != nil {
 				return fmt.Errorf("list checkpoints: %w", err)
 			}
@@ -43,7 +46,7 @@ This command does not require a running node — it reads directly from S3.`,
 				return fmt.Errorf("list WAL segments: %w", err)
 			}
 
-			branches, err := checkpoint.ReadBranchEntries(ctx, store)
+			branches, err := cp.ReadBranchEntries(ctx, store)
 			if err != nil {
 				return fmt.Errorf("read branch entries: %w", err)
 			}

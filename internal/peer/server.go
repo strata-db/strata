@@ -6,7 +6,6 @@ import (
 	"math"
 	"sync"
 
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -36,12 +35,12 @@ const (
 //
 // Thread safety: Broadcast and Follow both hold mu.
 type Server struct {
-	mu               sync.Mutex
-	buf              *entryBuffer
-	followers        map[string]chan *wal.Entry
-	followerAckRevs  map[string]int64 // last ACK'd revision per follower
-	maxBroadcastRev  int64            // highest revision sent via Broadcast
-	forwardHandler   ForwardHandler
+	mu              sync.Mutex
+	buf             *entryBuffer
+	followers       map[string]chan *wal.Entry
+	followerAckRevs map[string]int64 // last ACK'd revision per follower
+	maxBroadcastRev int64            // highest revision sent via Broadcast
+	forwardHandler  ForwardHandler
 
 	// ackNotify is a buffered-1 channel. A non-blocking send is made whenever
 	// any follower ACKs an entry or disconnects, waking WaitForFollowers.
@@ -67,10 +66,15 @@ type Server struct {
 	// immediately fence writes and check the S3 lock. Capacity 1 so sends
 	// never block and rapid-fire disconnects coalesce into a single check.
 	DisconnectC chan struct{}
+
+	log peerLogger
 }
 
 // NewServer creates a Server with a ring buffer of capacity cap.
-func NewServer(cap int) *Server {
+func NewServer(cap int, log peerLogger) *Server {
+	if log == nil {
+		log = stdlibPeerLogger{}
+	}
 	return &Server{
 		buf:              newEntryBuffer(cap),
 		followers:        make(map[string]chan *wal.Entry),
@@ -79,6 +83,7 @@ func NewServer(cap int) *Server {
 		gracefulGoodbyes: make(map[string]struct{}),
 		shutdownC:        make(chan struct{}),
 		DisconnectC:      make(chan struct{}, 1),
+		log:              log,
 	}
 }
 
@@ -125,7 +130,7 @@ func (s *Server) Broadcast(e *wal.Entry) {
 			// reconnects from its last applied revision, re-fetching the gap
 			// from the ring buffer. Silently dropping the entry and continuing
 			// would leave the follower with a permanent hole.
-			logrus.Warnf("peer: follower %q too slow — disconnecting to force resync at rev=%d", id, e.Revision)
+			s.log.Warnf("peer: follower %q too slow — disconnecting to force resync at rev=%d", id, e.Revision)
 			toKick = append(toKick, id)
 		}
 	}
@@ -248,7 +253,7 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 	// The follower must re-sync from S3 before it can consume the live stream.
 	if s.startRev > 0 && req.FromRevision < s.startRev {
 		s.mu.Unlock()
-		logrus.Warnf("peer: follower %q needs resync (fromRev=%d < leaderStartRev=%d)",
+		s.log.Warnf("peer: follower %q needs resync (fromRev=%d < leaderStartRev=%d)",
 			req.NodeID, req.FromRevision, s.startRev)
 		metrics.FollowerResyncsTotal.WithLabelValues("behind_leader_start").Inc()
 		return ErrResyncRequired
@@ -294,7 +299,7 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 		s.notifyACK()
 	}()
 
-	logrus.Infof("peer: follower %q connected (fromRev=%d, snapshot=%d entries)", req.NodeID, req.FromRevision, len(snapshot))
+	s.log.Infof("peer: follower %q connected (fromRev=%d, snapshot=%d entries)", req.NodeID, req.FromRevision, len(snapshot))
 
 	// Spawn a goroutine to read ACK messages from the follower on the bidi
 	// stream. The main goroutine continues sending WalEntryMsgs concurrently.
@@ -346,10 +351,10 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 			// follower so it starts a TakeOver immediately.
 			msg := &WalEntryMsg{Shutdown: true}
 			_ = stream.Send(msg) // best-effort; follower will also detect stream close
-			logrus.Infof("peer: sent shutdown signal to follower %q", req.NodeID)
+			s.log.Infof("peer: sent shutdown signal to follower %q", req.NodeID)
 			return nil
 		case <-stream.Context().Done():
-			logrus.Infof("peer: follower %q disconnected", req.NodeID)
+			s.log.Infof("peer: follower %q disconnected", req.NodeID)
 			return stream.Context().Err()
 		}
 	}
@@ -362,7 +367,7 @@ func (s *Server) GoodBye(_ context.Context, req *GoodByeRequest) (*GoodByeRespon
 	s.mu.Lock()
 	s.gracefulGoodbyes[req.NodeID] = struct{}{}
 	s.mu.Unlock()
-	logrus.Infof("peer: follower %q sent goodbye (graceful shutdown)", req.NodeID)
+	s.log.Infof("peer: follower %q sent goodbye (graceful shutdown)", req.NodeID)
 	return &GoodByeResponse{}, nil
 }
 
@@ -377,7 +382,7 @@ func (s *Server) BroadcastShutdown() {
 		// already closed
 	default:
 		close(s.shutdownC)
-		logrus.Infof("peer: broadcasting shutdown to %d follower(s)", len(s.followers))
+		s.log.Infof("peer: broadcasting shutdown to %d follower(s)", len(s.followers))
 	}
 }
 func (s *Server) Forward(ctx context.Context, req *ForwardRequest) (*ForwardResponse, error) {

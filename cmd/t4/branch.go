@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/t4db/t4"
@@ -42,7 +43,8 @@ Use --checkpoint to fork from a specific older revision instead.`,
 			var cpKey string
 			if checkpointKey != "" {
 				// Fork from a specific checkpoint rather than the latest.
-				if err := checkpoint.RegisterBranch(cmd.Context(), sourceStore, branchID, checkpointKey); err != nil {
+				cp := checkpoint.New(logrus.StandardLogger())
+				if err := cp.RegisterBranch(cmd.Context(), sourceStore, branchID, checkpointKey); err != nil {
 					return fmt.Errorf("register branch: %w", err)
 				}
 				cpKey = checkpointKey

@@ -18,6 +18,9 @@ import (
 	"github.com/t4db/t4/pkg/object"
 )
 
+// testCP is a shared Manager for checkpoint tests (no logger output needed).
+var testCP = checkpoint.New(nil)
+
 // versionedMem wraps MemStore to record a version ID for every Put, allowing
 // RestoreVersioned to be tested without real S3.
 type versionedMem struct {
@@ -85,7 +88,7 @@ func openDB(t *testing.T) *pebble.DB {
 
 func TestReadManifestMissing(t *testing.T) {
 	store := object.NewMem()
-	m, err := checkpoint.ReadManifest(context.Background(), store)
+	m, err := testCP.ReadManifest(context.Background(), store)
 	if err != nil {
 		t.Fatalf("ReadManifest on empty store: %v", err)
 	}
@@ -104,11 +107,11 @@ func TestWriteReadManifest(t *testing.T) {
 		Term:          1,
 		LastWALKey:    "wal/0000000001/00000000000000000040",
 	}
-	if err := checkpoint.WriteManifest(ctx, store, want); err != nil {
+	if err := testCP.WriteManifest(ctx, store, want); err != nil {
 		t.Fatalf("WriteManifest: %v", err)
 	}
 
-	got, err := checkpoint.ReadManifest(ctx, store)
+	got, err := testCP.ReadManifest(ctx, store)
 	if err != nil {
 		t.Fatalf("ReadManifest: %v", err)
 	}
@@ -133,12 +136,12 @@ func TestWriteManifestOverwrite(t *testing.T) {
 	store := object.NewMem()
 	ctx := context.Background()
 
-	checkpoint.WriteManifest(ctx, store, &checkpoint.Manifest{Revision: 1, Term: 1,
+	testCP.WriteManifest(ctx, store, &checkpoint.Manifest{Revision: 1, Term: 1,
 		CheckpointKey: checkpoint.CheckpointIndexKey(1, 1)})
-	checkpoint.WriteManifest(ctx, store, &checkpoint.Manifest{Revision: 2, Term: 1,
+	testCP.WriteManifest(ctx, store, &checkpoint.Manifest{Revision: 2, Term: 1,
 		CheckpointKey: checkpoint.CheckpointIndexKey(1, 2)})
 
-	m, _ := checkpoint.ReadManifest(ctx, store)
+	m, _ := testCP.ReadManifest(ctx, store)
 	if m.Revision != 2 {
 		t.Errorf("overwrite: want revision 2, got %d", m.Revision)
 	}
@@ -176,7 +179,7 @@ func TestGCCheckpoints(t *testing.T) {
 	}
 
 	// Keep the 2 most recent; should delete 3.
-	deleted, _, err := checkpoint.GCCheckpoints(ctx, store, 2)
+	deleted, _, err := testCP.GCCheckpoints(ctx, store, 2)
 	if err != nil {
 		t.Fatalf("GCCheckpoints: %v", err)
 	}
@@ -185,7 +188,7 @@ func TestGCCheckpoints(t *testing.T) {
 	}
 
 	// Remaining keys should only be the last 2.
-	remaining, _ := checkpoint.ListRemote(ctx, store)
+	remaining, _ := testCP.ListRemote(ctx, store)
 	if len(remaining) != 2 {
 		t.Errorf("remaining: want 2, got %d: %v", len(remaining), remaining)
 	}
@@ -213,19 +216,19 @@ func TestGCCheckpointsBranchProtection(t *testing.T) {
 
 	// Pin checkpoint rev=1 with a branch.
 	pinnedKey := checkpoint.CheckpointIndexKey(1, 1)
-	if err := checkpoint.RegisterBranch(ctx, store, "experiment", pinnedKey); err != nil {
+	if err := testCP.RegisterBranch(ctx, store, "experiment", pinnedKey); err != nil {
 		t.Fatalf("RegisterBranch: %v", err)
 	}
 
 	// GC with keep=2: would normally delete revs 1-3, but rev=1 is pinned.
-	deleted, _, err := checkpoint.GCCheckpoints(ctx, store, 2)
+	deleted, _, err := testCP.GCCheckpoints(ctx, store, 2)
 	if err != nil {
 		t.Fatalf("GCCheckpoints: %v", err)
 	}
 	if deleted != 2 { // revs 2 and 3 deleted; rev 1 protected
 		t.Errorf("deleted: want 2, got %d", deleted)
 	}
-	remaining, _ := checkpoint.ListRemote(ctx, store)
+	remaining, _ := testCP.ListRemote(ctx, store)
 	// Should have: pinned rev=1, plus kept rev=4 and rev=5.
 	if len(remaining) != 3 {
 		t.Errorf("remaining: want 3, got %d: %v", len(remaining), remaining)
@@ -241,17 +244,17 @@ func TestGCCheckpointsBranchProtection(t *testing.T) {
 	}
 
 	// Unregister the branch; now GC should be able to remove the old checkpoint.
-	if err := checkpoint.UnregisterBranch(ctx, store, "experiment"); err != nil {
+	if err := testCP.UnregisterBranch(ctx, store, "experiment"); err != nil {
 		t.Fatalf("UnregisterBranch: %v", err)
 	}
-	deleted, _, err = checkpoint.GCCheckpoints(ctx, store, 2)
+	deleted, _, err = testCP.GCCheckpoints(ctx, store, 2)
 	if err != nil {
 		t.Fatalf("GCCheckpoints after unregister: %v", err)
 	}
 	if deleted != 1 { // now rev=1 can be deleted
 		t.Errorf("after unregister deleted: want 1, got %d", deleted)
 	}
-	remaining, _ = checkpoint.ListRemote(ctx, store)
+	remaining, _ = testCP.ListRemote(ctx, store)
 	if len(remaining) != 2 {
 		t.Errorf("after unregister remaining: want 2, got %d: %v", len(remaining), remaining)
 	}
@@ -265,7 +268,7 @@ func TestGCCheckpointsNoop(t *testing.T) {
 	idx := checkpoint.CheckpointIndex{Term: 1, Revision: 1}
 	b, _ := json.Marshal(idx)
 	store.Put(ctx, checkpoint.CheckpointIndexKey(1, 1), bytes.NewReader(b))
-	deleted, _, err := checkpoint.GCCheckpoints(ctx, store, 2)
+	deleted, _, err := testCP.GCCheckpoints(ctx, store, 2)
 	if err != nil {
 		t.Fatalf("GCCheckpoints: %v", err)
 	}
@@ -290,12 +293,12 @@ func TestWriteRestore(t *testing.T) {
 	}
 
 	// Create and upload checkpoint.
-	if err := checkpoint.Write(ctx, db, store, 1, 2, "", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 1, 2, "", nil); err != nil {
 		t.Fatalf("checkpoint.Write: %v", err)
 	}
 
 	// Manifest should be updated.
-	m, err := checkpoint.ReadManifest(ctx, store)
+	m, err := testCP.ReadManifest(ctx, store)
 	if err != nil || m == nil {
 		t.Fatalf("manifest after Write: err=%v m=%v", err, m)
 	}
@@ -305,7 +308,7 @@ func TestWriteRestore(t *testing.T) {
 
 	// Restore to a new directory.
 	targetDir := filepath.Join(t.TempDir(), "restored")
-	term, rev, err := checkpoint.Restore(ctx, store, m.CheckpointKey, targetDir)
+	term, rev, err := testCP.Restore(ctx, store, m.CheckpointKey, targetDir)
 	if err != nil {
 		t.Fatalf("checkpoint.Restore: %v", err)
 	}
@@ -341,11 +344,11 @@ func TestWriteRestoreWithLastWALKey(t *testing.T) {
 	store := object.NewMem()
 	ctx := context.Background()
 
-	if err := checkpoint.Write(ctx, db, store, 2, 99, "wal/0000000002/00000000000000000090", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 2, 99, "wal/0000000002/00000000000000000090", nil); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
-	m, _ := checkpoint.ReadManifest(ctx, store)
+	m, _ := testCP.ReadManifest(ctx, store)
 	if m.LastWALKey != "wal/0000000002/00000000000000000090" {
 		t.Errorf("LastWALKey: want wal/0000000002/00000000000000000090, got %q", m.LastWALKey)
 	}
@@ -353,7 +356,7 @@ func TestWriteRestoreWithLastWALKey(t *testing.T) {
 
 func TestRestoreNotFound(t *testing.T) {
 	store := object.NewMem()
-	_, _, err := checkpoint.Restore(context.Background(), store, "checkpoint/missing", t.TempDir())
+	_, _, err := testCP.Restore(context.Background(), store, "checkpoint/missing", t.TempDir())
 	if err == nil {
 		t.Error("expected error restoring non-existent checkpoint")
 	}
@@ -366,11 +369,11 @@ func TestListRemote(t *testing.T) {
 	ctx := context.Background()
 
 	db := openDB(t)
-	checkpoint.Write(ctx, db, store, 1, 10, "", nil)
-	checkpoint.Write(ctx, db, store, 1, 20, "", nil)
-	checkpoint.Write(ctx, db, store, 2, 30, "", nil)
+	testCP.Write(ctx, db, store, 1, 10, "", nil)
+	testCP.Write(ctx, db, store, 1, 20, "", nil)
+	testCP.Write(ctx, db, store, 2, 30, "", nil)
 
-	keys, err := checkpoint.ListRemote(ctx, store)
+	keys, err := testCP.ListRemote(ctx, store)
 	if err != nil {
 		t.Fatalf("ListRemote: %v", err)
 	}
@@ -386,7 +389,7 @@ func TestListRemote(t *testing.T) {
 }
 
 func TestListRemoteEmpty(t *testing.T) {
-	keys, err := checkpoint.ListRemote(context.Background(), object.NewMem())
+	keys, err := testCP.ListRemote(context.Background(), object.NewMem())
 	if err != nil {
 		t.Fatalf("ListRemote empty: %v", err)
 	}
@@ -423,7 +426,7 @@ func TestRestoreRejectsPathTraversal(t *testing.T) {
 	store.Put(ctx, "checkpoint/evil", bytes.NewReader(buf.Bytes()))
 
 	targetDir := t.TempDir()
-	_, _, err := checkpoint.Restore(ctx, store, "checkpoint/evil", targetDir)
+	_, _, err := testCP.Restore(ctx, store, "checkpoint/evil", targetDir)
 	if err == nil {
 		t.Error("expected error for path traversal, got nil")
 	}
@@ -444,12 +447,12 @@ func TestWriteRestoreMultiple(t *testing.T) {
 
 	for i := int64(1); i <= 3; i++ {
 		db.Set([]byte(fmt.Sprintf("k%d", i)), []byte("v"), pebble.Sync)
-		if err := checkpoint.Write(ctx, db, store, 1, i, "", nil); err != nil {
+		if err := testCP.Write(ctx, db, store, 1, i, "", nil); err != nil {
 			t.Fatalf("Write rev=%d: %v", i, err)
 		}
 	}
 
-	m, err := checkpoint.ReadManifest(ctx, store)
+	m, err := testCP.ReadManifest(ctx, store)
 	if err != nil || m == nil {
 		t.Fatalf("manifest: err=%v m=%v", err, m)
 	}
@@ -457,14 +460,14 @@ func TestWriteRestoreMultiple(t *testing.T) {
 		t.Errorf("manifest should point to latest: want rev=3 got %d", m.Revision)
 	}
 
-	keys, _ := checkpoint.ListRemote(ctx, store)
+	keys, _ := testCP.ListRemote(ctx, store)
 	if len(keys) != 3 {
 		t.Errorf("ListRemote: want 3 checkpoints got %d", len(keys))
 	}
 
 	// Restore the latest and verify.
 	targetDir := filepath.Join(t.TempDir(), "latest")
-	term, rev, err := checkpoint.Restore(ctx, store, m.CheckpointKey, targetDir)
+	term, rev, err := testCP.Restore(ctx, store, m.CheckpointKey, targetDir)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -482,7 +485,7 @@ func TestRestoreVersioned(t *testing.T) {
 	ctx := context.Background()
 
 	db.Set([]byte("restored-key"), []byte("restored-val"), pebble.Sync)
-	if err := checkpoint.Write(ctx, db, store, 1, 1, "", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 1, 1, "", nil); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	indexKey := checkpoint.CheckpointIndexKey(1, 1)
@@ -497,13 +500,13 @@ func TestRestoreVersioned(t *testing.T) {
 	}
 
 	// Regular Restore should fail (index not found).
-	if _, _, err := checkpoint.Restore(ctx, store, indexKey, t.TempDir()); err == nil {
+	if _, _, err := testCP.Restore(ctx, store, indexKey, t.TempDir()); err == nil {
 		t.Fatal("Restore with deleted index: expected error, got nil")
 	}
 
 	// RestoreVersioned with the pinned version should succeed.
 	dir := t.TempDir()
-	term, rev, err := checkpoint.RestoreVersioned(ctx, store, indexKey, pinnedVer, dir)
+	term, rev, err := testCP.RestoreVersioned(ctx, store, indexKey, pinnedVer, dir)
 	if err != nil {
 		t.Fatalf("RestoreVersioned: %v", err)
 	}
@@ -528,7 +531,7 @@ func TestWriteSkipsExistingSSTs(t *testing.T) {
 
 	// Write data and first checkpoint.
 	db.Set([]byte("k1"), []byte("v1"), pebble.Sync)
-	if err := checkpoint.Write(ctx, db, store, 1, 1, "", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 1, 1, "", nil); err != nil {
 		t.Fatalf("Write 1: %v", err)
 	}
 	// Count SSTs after first checkpoint.
@@ -536,7 +539,7 @@ func TestWriteSkipsExistingSSTs(t *testing.T) {
 
 	// Write more data and second checkpoint.
 	db.Set([]byte("k2"), []byte("v2"), pebble.Sync)
-	if err := checkpoint.Write(ctx, db, store, 1, 2, "", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 1, 2, "", nil); err != nil {
 		t.Fatalf("Write 2: %v", err)
 	}
 	ssts2, _ := store.List(ctx, "sst/")
@@ -547,7 +550,7 @@ func TestWriteSkipsExistingSSTs(t *testing.T) {
 	}
 
 	// There should be exactly two v2 checkpoint manifests.
-	keys, _ := checkpoint.ListRemote(ctx, store)
+	keys, _ := testCP.ListRemote(ctx, store)
 	if len(keys) != 2 {
 		t.Errorf("want 2 checkpoints, got %d: %v", len(keys), keys)
 	}
@@ -589,7 +592,7 @@ func TestWriteNoListAfterFirst(t *testing.T) {
 	ctx := context.Background()
 
 	db.Set([]byte("k1"), []byte("v1"), pebble.Sync)
-	if err := checkpoint.Write(ctx, db, store, 1, 1, "", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 1, 1, "", nil); err != nil {
 		t.Fatalf("Write 1: %v", err)
 	}
 	// Reset counts — we only care about subsequent checkpoints.
@@ -598,7 +601,7 @@ func TestWriteNoListAfterFirst(t *testing.T) {
 	store.mu.Unlock()
 
 	db.Set([]byte("k2"), []byte("v2"), pebble.Sync)
-	if err := checkpoint.Write(ctx, db, store, 1, 2, "", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 1, 2, "", nil); err != nil {
 		t.Fatalf("Write 2: %v", err)
 	}
 	if n := store.listCount("sst/"); n != 0 {
@@ -606,7 +609,7 @@ func TestWriteNoListAfterFirst(t *testing.T) {
 	}
 
 	db.Set([]byte("k3"), []byte("v3"), pebble.Sync)
-	if err := checkpoint.Write(ctx, db, store, 1, 3, "", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 1, 3, "", nil); err != nil {
 		t.Fatalf("Write 3: %v", err)
 	}
 	if n := store.listCount("sst/"); n != 0 {
@@ -626,7 +629,7 @@ func TestGCOrphanSSTs(t *testing.T) {
 
 	// Write two checkpoints so GCCheckpoints has something to delete.
 	db.Set([]byte("k1"), []byte("v1"), pebble.Sync)
-	if err := checkpoint.Write(ctx, db, store, 1, 1, "", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 1, 1, "", nil); err != nil {
 		t.Fatalf("Write 1: %v", err)
 	}
 	ssts1, _ := store.List(ctx, "sst/")
@@ -635,7 +638,7 @@ func TestGCOrphanSSTs(t *testing.T) {
 	}
 
 	db.Set([]byte("k2"), []byte("v2"), pebble.Sync)
-	if err := checkpoint.Write(ctx, db, store, 1, 2, "", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 1, 2, "", nil); err != nil {
 		t.Fatalf("Write 2: %v", err)
 	}
 
@@ -644,7 +647,7 @@ func TestGCOrphanSSTs(t *testing.T) {
 
 	// GCCheckpoints returns candidates — SSTs from the deleted checkpoint that
 	// are NOT referenced by the surviving checkpoint.
-	cpDeleted, candidates, err := checkpoint.GCCheckpoints(ctx, store, 1)
+	cpDeleted, candidates, err := testCP.GCCheckpoints(ctx, store, 1)
 	if err != nil {
 		t.Fatalf("GCCheckpoints: %v", err)
 	}
@@ -652,7 +655,7 @@ func TestGCOrphanSSTs(t *testing.T) {
 		t.Fatalf("GCCheckpoints: want 1 deleted, got %d", cpDeleted)
 	}
 
-	deleted, err := checkpoint.GCOrphanSSTs(ctx, store, candidates)
+	deleted, err := testCP.GCOrphanSSTs(ctx, store, candidates)
 	if err != nil {
 		t.Fatalf("GCOrphanSSTs: %v", err)
 	}
@@ -667,7 +670,7 @@ func TestGCOrphanSSTs(t *testing.T) {
 
 	// Surviving checkpoint's SSTs must still exist.
 	_, _ = store.List(ctx, "sst/")
-	cpKeys, _ := checkpoint.ListRemote(ctx, store)
+	cpKeys, _ := testCP.ListRemote(ctx, store)
 	if len(cpKeys) != 1 {
 		t.Errorf("surviving checkpoints: want 1, got %d", len(cpKeys))
 	}
@@ -683,7 +686,7 @@ func TestGCOrphanSSTsBranchProtection(t *testing.T) {
 
 	// Write checkpoint that branch will reference.
 	db.Set([]byte("k1"), []byte("v1"), pebble.Sync)
-	if err := checkpoint.Write(ctx, db, store, 1, 1, "", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 1, 1, "", nil); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 	ssts, _ := store.List(ctx, "sst/")
@@ -693,17 +696,17 @@ func TestGCOrphanSSTsBranchProtection(t *testing.T) {
 	ancestorKey := checkpoint.CheckpointIndexKey(1, 1)
 
 	// Register a branch pointing at the checkpoint.
-	if err := checkpoint.RegisterBranch(ctx, store, "my-branch", ancestorKey); err != nil {
+	if err := testCP.RegisterBranch(ctx, store, "my-branch", ancestorKey); err != nil {
 		t.Fatalf("RegisterBranch: %v", err)
 	}
 
 	// Write a second checkpoint. GC the first — but it's pinned by the branch,
 	// so GCCheckpoints should NOT delete it and candidates should be empty.
 	db.Set([]byte("k2"), []byte("v2"), pebble.Sync)
-	if err := checkpoint.Write(ctx, db, store, 1, 2, "", nil); err != nil {
+	if err := testCP.Write(ctx, db, store, 1, 2, "", nil); err != nil {
 		t.Fatalf("Write 2: %v", err)
 	}
-	cpDeleted, candidates, err := checkpoint.GCCheckpoints(ctx, store, 1)
+	cpDeleted, candidates, err := testCP.GCCheckpoints(ctx, store, 1)
 	if err != nil {
 		t.Fatalf("GCCheckpoints: %v", err)
 	}
@@ -712,7 +715,7 @@ func TestGCOrphanSSTsBranchProtection(t *testing.T) {
 	}
 
 	// GCOrphanSSTs with empty candidates: branch-protected SSTs untouched.
-	deleted, err := checkpoint.GCOrphanSSTs(ctx, store, candidates)
+	deleted, err := testCP.GCOrphanSSTs(ctx, store, candidates)
 	if err != nil {
 		t.Fatalf("GCOrphanSSTs with branch: %v", err)
 	}
@@ -722,17 +725,17 @@ func TestGCOrphanSSTsBranchProtection(t *testing.T) {
 
 	// Unregister branch; now GCCheckpoints can delete the old checkpoint and
 	// return its SSTs as candidates.
-	if err := checkpoint.UnregisterBranch(ctx, store, "my-branch"); err != nil {
+	if err := testCP.UnregisterBranch(ctx, store, "my-branch"); err != nil {
 		t.Fatalf("UnregisterBranch: %v", err)
 	}
-	cpDeleted2, candidates2, err := checkpoint.GCCheckpoints(ctx, store, 1)
+	cpDeleted2, candidates2, err := testCP.GCCheckpoints(ctx, store, 1)
 	if err != nil {
 		t.Fatalf("GCCheckpoints after unregister: %v", err)
 	}
 	if cpDeleted2 != 1 {
 		t.Errorf("after unregister: want 1 checkpoint deleted, got %d", cpDeleted2)
 	}
-	deleted2, err := checkpoint.GCOrphanSSTs(ctx, store, candidates2)
+	deleted2, err := testCP.GCOrphanSSTs(ctx, store, candidates2)
 	if err != nil {
 		t.Fatalf("GCOrphanSSTs after unregister: %v", err)
 	}

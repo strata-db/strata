@@ -36,7 +36,8 @@ func restoreListCmd() *cobra.Command {
 				return fmt.Errorf("init S3: %w", err)
 			}
 			ctx := cmd.Context()
-			keys, err := checkpoint.ListRemote(ctx, store)
+			cp := checkpoint.New(logrus.StandardLogger())
+			keys, err := cp.ListRemote(ctx, store)
 			if err != nil {
 				return fmt.Errorf("list checkpoints: %w", err)
 			}
@@ -44,10 +45,10 @@ func restoreListCmd() *cobra.Command {
 				fmt.Println("No checkpoints found.")
 				return nil
 			}
-			manifest, _ := checkpoint.ReadManifest(ctx, store)
+			manifest, _ := cp.ReadManifest(ctx, store)
 			fmt.Printf("%-72s  %10s  %6s\n", "CHECKPOINT", "REVISION", "TERM")
 			for _, key := range keys {
-				idx, err := checkpoint.ReadCheckpointIndex(ctx, store, key)
+				idx, err := cp.ReadCheckpointIndex(ctx, store, key)
 				suffix := ""
 				if manifest != nil && manifest.CheckpointKey == key {
 					suffix = "  (latest)"
@@ -104,10 +105,11 @@ replaying newer WAL from S3, omit --s3-bucket entirely.`,
 				return fmt.Errorf("init S3: %w", err)
 			}
 			ctx := cmd.Context()
+			cp := checkpoint.New(logrus.StandardLogger())
 
 			key := checkpointKey
 			if key == "" {
-				manifest, err := checkpoint.ReadManifest(ctx, store)
+				manifest, err := cp.ReadManifest(ctx, store)
 				if err != nil {
 					return fmt.Errorf("read manifest: %w", err)
 				}
@@ -119,7 +121,7 @@ replaying newer WAL from S3, omit --s3-bucket entirely.`,
 			}
 
 			logrus.Infof("restoring checkpoint %q → %s", key, pebbleDir)
-			term, rev, err := checkpoint.Restore(ctx, store, key, pebbleDir)
+			term, rev, err := cp.Restore(ctx, store, key, pebbleDir)
 			if err != nil {
 				return fmt.Errorf("restore checkpoint: %w", err)
 			}

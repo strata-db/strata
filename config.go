@@ -164,6 +164,26 @@ type Config struct {
 
 	// ── Observability ────────────────────────────────────────────────────────
 
+	// Logger, if set, receives all t4 log output.  When nil the global
+	// logrus logger is used (logrus.StandardLogger()).
+	//
+	// In embedded mode, supply your own Logger to control destination, level,
+	// and format independently from t4's internals.  This also silences the
+	// noisy Pebble storage-engine messages (WAL recovery, compaction) which
+	// are downgraded to DEBUG by the built-in Pebble adapter – so setting
+	// your logger's level to INFO or above is enough to hide them.
+	//
+	// *logrus.Logger already implements Logger.  For other libraries:
+	//
+	//	// Silence all t4 output:
+	//	cfg.Logger = t4.NoopLogger
+	//
+	//	// Logrus at warn level:
+	//	l := logrus.New()
+	//	l.SetLevel(logrus.WarnLevel)
+	//	cfg.Logger = l
+	Logger Logger
+
 	// MetricsAddr is the TCP address for the Prometheus /metrics, /healthz,
 	// and /readyz HTTP endpoints (e.g. "0.0.0.0:9090"). Empty means disabled.
 	MetricsAddr string
@@ -207,5 +227,8 @@ func (c *Config) setDefaults() {
 	}
 	if c.PeerBufferSize == 0 {
 		c.PeerBufferSize = 10_000
+	}
+	if c.Logger == nil {
+		c.Logger = defaultLogger()
 	}
 }

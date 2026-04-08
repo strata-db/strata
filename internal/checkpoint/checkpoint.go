@@ -10,15 +10,43 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/sirupsen/logrus"
 	"github.com/t4db/t4/pkg/object"
 )
+
+// checkpointLogger is the minimal leveled logging interface used by the
+// checkpoint package.
+type checkpointLogger interface {
+	Warnf(format string, args ...interface{})
+}
+
+// stdlibCheckpointLogger is used when New is called with nil.
+type stdlibCheckpointLogger struct{}
+
+func (stdlibCheckpointLogger) Warnf(format string, args ...interface{}) {
+	log.Printf("[WARN] "+format, args...)
+}
+
+// Manager handles checkpoint creation, reading, and restoration.
+// Create one with New and store it on the Node so each node has its own
+// logger — no global state.
+type Manager struct {
+	log checkpointLogger
+}
+
+// New creates a Manager.  If log is nil a stdlib-backed logger is used.
+func New(log checkpointLogger) *Manager {
+	if log == nil {
+		log = stdlibCheckpointLogger{}
+	}
+	return &Manager{log: log}
+}
 
 // FormatVersion constants for checkpoint objects.
 //
@@ -105,7 +133,7 @@ func contentSSTKey(path, name string) (string, error) {
 
 // ReadManifest reads and parses the manifest from object storage.
 // Returns nil, nil if no manifest exists yet.
-func ReadManifest(ctx context.Context, store object.Store) (*Manifest, error) {
+func (m *Manager) ReadManifest(ctx context.Context, store object.Store) (*Manifest, error) {
 	rc, err := store.Get(ctx, ManifestKey)
 	if err == object.ErrNotFound {
 		return nil, nil
@@ -114,21 +142,21 @@ func ReadManifest(ctx context.Context, store object.Store) (*Manifest, error) {
 		return nil, fmt.Errorf("checkpoint: read manifest: %w", err)
 	}
 	defer rc.Close()
-	var m Manifest
-	if err := json.NewDecoder(rc).Decode(&m); err != nil {
+	var manifest Manifest
+	if err := json.NewDecoder(rc).Decode(&manifest); err != nil {
 		return nil, fmt.Errorf("checkpoint: decode manifest: %w", err)
 	}
 	// FormatVersion == 0 means the manifest was written by an older node that
 	// did not emit the field (backward-compatible: treat as version 1).
-	if m.FormatVersion > CheckpointFormatVersion {
-		logrus.Warnf("checkpoint: manifest format_version=%d > known=%d — this node may be too old; upgrade recommended",
-			m.FormatVersion, CheckpointFormatVersion)
+	if manifest.FormatVersion > CheckpointFormatVersion {
+		m.log.Warnf("checkpoint: manifest format_version=%d > known=%d — this node may be too old; upgrade recommended",
+			manifest.FormatVersion, CheckpointFormatVersion)
 	}
-	return &m, nil
+	return &manifest, nil
 }
 
 // WriteManifest writes m to object storage.
-func WriteManifest(ctx context.Context, store object.Store, m *Manifest) error {
+func (mgr *Manager) WriteManifest(ctx context.Context, store object.Store, m *Manifest) error {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
@@ -151,7 +179,7 @@ func WriteManifest(ctx context.Context, store object.Store, m *Manifest) error {
 // SST deduplication uses the previous checkpoint index rather than issuing a
 // LIST request, keeping the per-checkpoint S3 cost to O(1) GETs regardless of
 // how many SST files have accumulated in the bucket.
-func Write(ctx context.Context, db *pebble.DB, store object.Store, term uint64, revision int64, lastWALKey string, ancestorStore object.Store) error {
+func (mgr *Manager) Write(ctx context.Context, db *pebble.DB, store object.Store, term uint64, revision int64, lastWALKey string, ancestorStore object.Store) error {
 	tmpDir, err := os.MkdirTemp("", "t4-checkpoint-*")
 	if err != nil {
 		return fmt.Errorf("checkpoint: mktemp: %w", err)
@@ -167,7 +195,7 @@ func Write(ctx context.Context, db *pebble.DB, store object.Store, term uint64, 
 	// of issuing a LIST sst/ (which grows with bucket size). On a brand-new
 	// store there is no previous index, so both sets start empty and every SST
 	// is uploaded — correct behaviour for a first checkpoint.
-	localSSTs, ancestorSSTs, err := knownSSTSets(ctx, store, ancestorStore)
+	localSSTs, ancestorSSTs, err := mgr.knownSSTSets(ctx, store, ancestorStore)
 	if err != nil {
 		return fmt.Errorf("checkpoint: resolve known ssts: %w", err)
 	}
@@ -218,7 +246,7 @@ func Write(ctx context.Context, db *pebble.DB, store object.Store, term uint64, 
 		return fmt.Errorf("checkpoint: walk: %w", err)
 	}
 
-	return writeIndex(ctx, store, term, revision, lastWALKey, sstFiles, ancestorSSTFiles, metaFiles)
+	return mgr.writeIndex(ctx, store, term, revision, lastWALKey, sstFiles, ancestorSSTFiles, metaFiles)
 }
 
 // WriteWithRegistry creates a Pebble checkpoint using a pre-built SST registry
@@ -229,7 +257,7 @@ func Write(ctx context.Context, db *pebble.DB, store object.Store, term uint64, 
 // localRegistry maps Pebble SST filename → "sst/{hash}/{name}" key in store.
 // inheritedRegistry maps Pebble SST filename → s3 key in the ancestor store
 // (for branch nodes); these are recorded as AncestorSSTFiles.
-func WriteWithRegistry(ctx context.Context, db *pebble.DB, store object.Store, term uint64, revision int64, lastWALKey string, localRegistry, inheritedRegistry map[string]string) error {
+func (mgr *Manager) WriteWithRegistry(ctx context.Context, db *pebble.DB, store object.Store, term uint64, revision int64, lastWALKey string, localRegistry, inheritedRegistry map[string]string) error {
 	tmpDir, err := os.MkdirTemp("", "t4-checkpoint-*")
 	if err != nil {
 		return fmt.Errorf("checkpoint: mktemp: %w", err)
@@ -290,11 +318,11 @@ func WriteWithRegistry(ctx context.Context, db *pebble.DB, store object.Store, t
 		return fmt.Errorf("checkpoint: walk: %w", err)
 	}
 
-	return writeIndex(ctx, store, term, revision, lastWALKey, sstFiles, ancestorSSTFiles, metaFiles)
+	return mgr.writeIndex(ctx, store, term, revision, lastWALKey, sstFiles, ancestorSSTFiles, metaFiles)
 }
 
 // writeIndex writes the checkpoint index JSON and updates manifest/latest.
-func writeIndex(ctx context.Context, store object.Store, term uint64, revision int64, lastWALKey string, sstFiles, ancestorSSTFiles, metaFiles []string) error {
+func (mgr *Manager) writeIndex(ctx context.Context, store object.Store, term uint64, revision int64, lastWALKey string, sstFiles, ancestorSSTFiles, metaFiles []string) error {
 	indexKey := CheckpointIndexKey(term, revision)
 	idx := &CheckpointIndex{
 		FormatVersion:    CheckpointFormatVersion,
@@ -319,7 +347,7 @@ func writeIndex(ctx context.Context, store object.Store, term uint64, revision i
 		Term:          term,
 		LastWALKey:    lastWALKey,
 	}
-	return WriteManifest(ctx, store, m)
+	return mgr.WriteManifest(ctx, store, m)
 }
 
 // knownSSTSets returns the sets of SST keys already uploaded to store and to
@@ -333,15 +361,15 @@ func writeIndex(ctx context.Context, store object.Store, term uint64, revision i
 // ancestor store's sst/ prefix once. On every subsequent checkpoint the
 // ancestor set is carried forward from the previous index's AncestorSSTFiles,
 // so no LIST is needed after the first.
-func knownSSTSets(ctx context.Context, store object.Store, ancestorStore object.Store) (local, ancestor map[string]struct{}, err error) {
+func (mgr *Manager) knownSSTSets(ctx context.Context, store object.Store, ancestorStore object.Store) (local, ancestor map[string]struct{}, err error) {
 	local = make(map[string]struct{})
 	ancestor = make(map[string]struct{})
 
-	manifest, err := ReadManifest(ctx, store)
+	manifest, err := mgr.ReadManifest(ctx, store)
 	if err != nil || manifest == nil {
 		err = nil // fresh store; sets stay empty
 	} else {
-		prevIdx, idxErr := ReadCheckpointIndex(ctx, store, manifest.CheckpointKey)
+		prevIdx, idxErr := mgr.ReadCheckpointIndex(ctx, store, manifest.CheckpointKey)
 		if idxErr == nil {
 			for _, k := range prevIdx.SSTFiles {
 				local[k] = struct{}{}
@@ -381,20 +409,20 @@ func listSSTSet(ctx context.Context, store object.Store) (map[string]struct{}, e
 
 // Restore downloads a checkpoint and restores it to targetDir (which must not
 // exist). Returns the term and revision encoded in the checkpoint.
-func Restore(ctx context.Context, store object.Store, objKey, targetDir string) (term uint64, revision int64, err error) {
-	return restoreFromIndex(ctx, store, nil, objKey, targetDir)
+func (mgr *Manager) Restore(ctx context.Context, store object.Store, objKey, targetDir string) (term uint64, revision int64, err error) {
+	return restoreFromIndex(ctx, mgr, store, nil, objKey, targetDir)
 }
 
 // RestoreBranch restores a checkpoint that may reference SST files in a
 // separate ancestorStore. Used by branch nodes on first boot via BranchPoint.
-func RestoreBranch(ctx context.Context, store object.Store, ancestorStore object.Store, objKey, targetDir string) (term uint64, revision int64, err error) {
-	return restoreFromIndex(ctx, store, ancestorStore, objKey, targetDir)
+func (mgr *Manager) RestoreBranch(ctx context.Context, store object.Store, ancestorStore object.Store, objKey, targetDir string) (term uint64, revision int64, err error) {
+	return restoreFromIndex(ctx, mgr, store, ancestorStore, objKey, targetDir)
 }
 
 // restoreFromIndex restores a v2 checkpoint from its CheckpointIndex.
 // ancestorStore is used for AncestorSSTFiles; if nil, store is used for all.
-func restoreFromIndex(ctx context.Context, store object.Store, ancestorStore object.Store, indexKey, targetDir string) (uint64, int64, error) {
-	idx, err := ReadCheckpointIndex(ctx, store, indexKey)
+func restoreFromIndex(ctx context.Context, mgr *Manager, store object.Store, ancestorStore object.Store, indexKey, targetDir string) (uint64, int64, error) {
+	idx, err := mgr.ReadCheckpointIndex(ctx, store, indexKey)
 	if err != nil {
 		return 0, 0, fmt.Errorf("checkpoint: read index %q: %w", indexKey, err)
 	}
@@ -433,7 +461,7 @@ func restoreFromIndex(ctx context.Context, store object.Store, ancestorStore obj
 // restores it to targetDir. SSTs and pebble meta are fetched from the live
 // store (content-addressed SSTs are immutable; meta files remain live as long
 // as they're within the keep window). Requires S3 versioning on the store.
-func RestoreVersioned(ctx context.Context, store object.VersionedStore, objKey, versionID, targetDir string) (term uint64, revision int64, err error) {
+func (mgr *Manager) RestoreVersioned(ctx context.Context, store object.VersionedStore, objKey, versionID, targetDir string) (term uint64, revision int64, err error) {
 	rc, err := store.GetVersioned(ctx, objKey, versionID)
 	if err != nil {
 		return 0, 0, fmt.Errorf("checkpoint: download versioned %q@%s: %w", objKey, versionID, err)
@@ -464,7 +492,7 @@ func RestoreVersioned(ctx context.Context, store object.VersionedStore, objKey, 
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-func ReadCheckpointIndex(ctx context.Context, store object.Store, key string) (*CheckpointIndex, error) {
+func (mgr *Manager) ReadCheckpointIndex(ctx context.Context, store object.Store, key string) (*CheckpointIndex, error) {
 	rc, err := store.Get(ctx, key)
 	if err != nil {
 		return nil, err
@@ -476,7 +504,7 @@ func ReadCheckpointIndex(ctx context.Context, store object.Store, key string) (*
 		return nil, fmt.Errorf("decode checkpoint index %q: %w", key, decErr)
 	}
 	if idx.FormatVersion > CheckpointFormatVersion {
-		logrus.Warnf("checkpoint: index %q format_version=%d > known=%d — this node may be too old; upgrade recommended",
+		mgr.log.Warnf("checkpoint: index %q format_version=%d > known=%d — this node may be too old; upgrade recommended",
 			key, idx.FormatVersion, CheckpointFormatVersion)
 	}
 	return &idx, nil
@@ -501,7 +529,7 @@ func downloadFile(ctx context.Context, store object.Store, key, dest string) err
 
 // ListRemote returns the checkpoint index key for each checkpoint in object
 // storage, sorted lexicographically (== chronologically).
-func ListRemote(ctx context.Context, store object.Store) ([]string, error) {
+func (mgr *Manager) ListRemote(ctx context.Context, store object.Store) ([]string, error) {
 	keys, err := store.List(ctx, "checkpoint/")
 	if err != nil {
 		return nil, err
@@ -529,17 +557,17 @@ func ListRemote(ctx context.Context, store object.Store) ([]string, error) {
 // returns the count of deleted checkpoints. Pinned branch checkpoints are
 // never deleted. Also returns the set of SST keys that were referenced only
 // by deleted checkpoints (orphan candidates for GCOrphanSSTs).
-func GCCheckpoints(ctx context.Context, store object.Store, keep int) (int, map[string]struct{}, error) {
+func (mgr *Manager) GCCheckpoints(ctx context.Context, store object.Store, keep int) (int, map[string]struct{}, error) {
 	if keep < 1 {
 		keep = 1
 	}
 
-	manifest, err := ReadManifest(ctx, store)
+	manifest, err := mgr.ReadManifest(ctx, store)
 	if err != nil {
 		return 0, nil, fmt.Errorf("checkpoint gc: read manifest: %w", err)
 	}
 
-	branches, err := ReadBranchEntries(ctx, store)
+	branches, err := mgr.ReadBranchEntries(ctx, store)
 	if err != nil {
 		return 0, nil, fmt.Errorf("checkpoint gc: read branch entries: %w", err)
 	}
@@ -550,7 +578,7 @@ func GCCheckpoints(ctx context.Context, store object.Store, keep int) (int, map[
 		}
 	}
 
-	keys, err := ListRemote(ctx, store)
+	keys, err := mgr.ListRemote(ctx, store)
 	if err != nil {
 		return 0, nil, fmt.Errorf("checkpoint gc: list: %w", err)
 	}
@@ -561,7 +589,7 @@ func GCCheckpoints(ctx context.Context, store object.Store, keep int) (int, map[
 	// Collect SSTs referenced by surviving checkpoints so we never delete them.
 	liveSSTs := make(map[string]struct{})
 	for _, k := range keys[len(keys)-keep:] {
-		idx, err := ReadCheckpointIndex(ctx, store, k)
+		idx, err := mgr.ReadCheckpointIndex(ctx, store, k)
 		if err != nil {
 			continue
 		}
@@ -571,7 +599,7 @@ func GCCheckpoints(ctx context.Context, store object.Store, keep int) (int, map[
 	}
 	// Also protect SSTs from pinned (branch) checkpoints.
 	for k := range pinnedKeys {
-		idx, err := ReadCheckpointIndex(ctx, store, k)
+		idx, err := mgr.ReadCheckpointIndex(ctx, store, k)
 		if err != nil {
 			continue
 		}
@@ -593,7 +621,7 @@ func GCCheckpoints(ctx context.Context, store object.Store, keep int) (int, map[
 			continue // branch is pinned to this checkpoint; preserve it
 		}
 		// Harvest SST candidates from this checkpoint before deleting it.
-		idx, err := ReadCheckpointIndex(ctx, store, k)
+		idx, err := mgr.ReadCheckpointIndex(ctx, store, k)
 		if err == nil {
 			for _, s := range idx.SSTFiles {
 				if _, live := liveSSTs[s]; !live {
@@ -628,7 +656,7 @@ func deleteCheckpoint(ctx context.Context, store object.Store, key string) error
 // diffing against live checkpoints) closes a race where a newly-promoted leader
 // uploads SSTs before writing its first checkpoint: those SSTs would appear as
 // "orphans" in a full-LIST approach even though they are about to be referenced.
-func GCOrphanSSTs(ctx context.Context, store object.Store, candidates map[string]struct{}) (int, error) {
+func (mgr *Manager) GCOrphanSSTs(ctx context.Context, store object.Store, candidates map[string]struct{}) (int, error) {
 	if len(candidates) == 0 {
 		return 0, nil
 	}

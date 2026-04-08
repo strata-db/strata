@@ -4,18 +4,34 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
+// walLogger is the minimal logging interface required by WAL.
+type walLogger interface {
+	Debugf(format string, args ...interface{})
+	Warnf(format string, args ...interface{})
+	Errorf(format string, args ...interface{})
+}
+
+// stdlibLogger wraps the standard library log package so tests that call
+// Open without WithLogger still get output rather than a panic.
+type stdlibLogger struct{}
+
+func (stdlibLogger) Debugf(format string, args ...interface{}) {}
+func (stdlibLogger) Warnf(format string, args ...interface{})  { log.Printf("[WARN]  "+format, args...) }
+func (stdlibLogger) Errorf(format string, args ...interface{}) {
+	log.Printf("[ERROR] "+format, args...)
+}
+
 const (
-	DefaultSegmentMaxSize = 50 << 20        // 50 MB
+	DefaultSegmentMaxSize = 50 << 20         // 50 MB
 	DefaultSegmentMaxAge  = 60 * time.Second // 1 minute; controls S3 PUT frequency
 )
 
@@ -40,6 +56,7 @@ type WAL struct {
 	segMaxAge  time.Duration
 	uploader   Uploader // may be nil (no object storage)
 	syncUpload bool     // seal+upload synchronously on every AppendBatch
+	log        walLogger
 
 	mu     sync.Mutex
 	active *SegmentWriter
@@ -77,6 +94,9 @@ func Open(dir string, term uint64, startRev int64, opts ...Option) (*WAL, error)
 	for _, o := range opts {
 		o(w)
 	}
+	if w.log == nil {
+		w.log = stdlibLogger{}
+	}
 	sw, err := OpenSegmentWriter(dir, term, startRev)
 	if err != nil {
 		return nil, err
@@ -109,6 +129,12 @@ func WithSegmentMaxAge(d time.Duration) Option {
 // after. Has no effect when no uploader is configured.
 func WithSyncUpload() Option {
 	return func(w *WAL) { w.syncUpload = true }
+}
+
+// WithLogger sets the logger used by the WAL. When not provided the WAL
+// uses a stdlib-backed logger that discards DEBUG output.
+func WithLogger(log walLogger) Option {
+	return func(w *WAL) { w.log = log }
 }
 
 // Start launches background goroutines. Must be called before Append.
@@ -221,7 +247,7 @@ func (w *WAL) rotateSyncLocked(_ context.Context) error {
 	w.mu.Lock()
 
 	if uploadErr != nil {
-		logrus.Errorf("wal: sync upload %q → %q: %v", localPath, objKey, uploadErr)
+		w.log.Errorf("wal: sync upload %q → %q: %v", localPath, objKey, uploadErr)
 	}
 	return uploadErr
 }
@@ -237,7 +263,7 @@ func (w *WAL) rotateLocked() {
 	if err := seg.Seal(); err != nil {
 		// Seal failed; keep the old (unsealed) segment as active so the next
 		// Append returns an error rather than panicking on a nil dereference.
-		logrus.Errorf("wal: seal segment %q: %v", seg.Path(), err)
+		w.log.Errorf("wal: seal segment %q: %v", seg.Path(), err)
 		return
 	}
 	if w.uploader != nil {
@@ -245,15 +271,15 @@ func (w *WAL) rotateLocked() {
 		select {
 		case w.uploadC <- uploadTask{localPath: seg.Path(), objectKey: objKey}:
 		default:
-			logrus.Warnf("wal: upload queue full, dropping %q (will retry on restart)", seg.Path())
+			w.log.Warnf("wal: upload queue full, dropping %q (will retry on restart)", seg.Path())
 		}
 	}
-	logrus.Debugf("wal: sealed segment %q (%d entries, %d bytes)", seg.Path(), seg.EntryCount(), seg.Size())
+	w.log.Debugf("wal: sealed segment %q (%d entries, %d bytes)", seg.Path(), seg.EntryCount(), seg.Size())
 	sw, err := OpenSegmentWriter(w.dir, w.term, nextRev)
 	if err != nil {
 		// Cannot open the next segment. Keep the sealed segment as active so
 		// the next Append call returns a write error rather than panicking.
-		logrus.Errorf("wal: open new segment after rotation: %v", err)
+		w.log.Errorf("wal: open new segment after rotation: %v", err)
 		w.active = seg
 		return
 	}
@@ -272,7 +298,7 @@ func (w *WAL) rotationLoop(ctx context.Context) {
 			if w.active != nil && w.active.EntryCount() > 0 {
 				rev := w.active.FirstRev() + int64(w.active.EntryCount()) // approx next rev
 				if err := w.active.Seal(); err != nil {
-					logrus.Errorf("wal: age-rotate seal: %v", err)
+					w.log.Errorf("wal: age-rotate seal: %v", err)
 					w.mu.Unlock()
 					continue
 				}
@@ -281,7 +307,7 @@ func (w *WAL) rotationLoop(ctx context.Context) {
 				if err != nil {
 					// Keep the sealed segment as active so Append returns an
 					// error rather than panicking on a nil dereference.
-					logrus.Errorf("wal: age-rotate open new segment: %v", err)
+					w.log.Errorf("wal: age-rotate open new segment: %v", err)
 					w.active = old
 					w.mu.Unlock()
 					continue
@@ -291,7 +317,7 @@ func (w *WAL) rotationLoop(ctx context.Context) {
 					select {
 					case w.uploadC <- uploadTask{localPath: old.Path(), objectKey: objKey}:
 					default:
-						logrus.Warnf("wal: upload queue full, segment %q will be retried on restart", old.Path())
+						w.log.Warnf("wal: upload queue full, segment %q will be retried on restart", old.Path())
 					}
 				}
 				w.active = sw
@@ -317,7 +343,7 @@ func (w *WAL) uploadLoop(ctx context.Context) {
 				if ctx.Err() != nil {
 					return
 				}
-				logrus.Errorf("wal: upload %q → %q: %v", task.localPath, task.objectKey, err)
+				w.log.Errorf("wal: upload %q → %q: %v", task.localPath, task.objectKey, err)
 				// If the local file is gone the segment was already uploaded and
 				// cleaned up (or discarded as empty). Retrying cannot help.
 				if errors.Is(err, os.ErrNotExist) {
@@ -355,7 +381,7 @@ func (w *WAL) Close() error {
 	if w.active != nil {
 		if w.active.EntryCount() > 0 {
 			if err := w.active.Seal(); err != nil {
-				logrus.Errorf("wal: close seal: %v", err)
+				w.log.Errorf("wal: close seal: %v", err)
 			} else {
 				finalSeg = w.active
 			}
@@ -395,7 +421,7 @@ func (w *WAL) Close() error {
 		select {
 		case task := <-w.uploadC:
 			if err := w.uploader(uploadCtx, task.localPath, task.objectKey); err != nil {
-				logrus.Errorf("wal: close drain upload %q: %v", task.localPath, err)
+				w.log.Errorf("wal: close drain upload %q: %v", task.localPath, err)
 				if uploadErr == nil {
 					uploadErr = err
 				}
@@ -408,7 +434,7 @@ drained:
 	if finalSeg != nil {
 		objKey := ObjectKey(finalSeg.Term(), finalSeg.FirstRev())
 		if err := w.uploader(uploadCtx, finalSeg.Path(), objKey); err != nil {
-			logrus.Errorf("wal: close upload final segment: %v", err)
+			w.log.Errorf("wal: close upload final segment: %v", err)
 			if uploadErr == nil {
 				uploadErr = err
 			}

@@ -9,7 +9,7 @@ import (
 )
 
 func TestWaitForFollowersNoneReturnsImmediately(t *testing.T) {
-	srv := NewServer(16)
+	srv := NewServer(16, nil)
 	srv.mu.Lock()
 	srv.followers["f1"] = make(chan *wal.Entry)
 	srv.followers["f2"] = make(chan *wal.Entry)
@@ -24,7 +24,7 @@ func TestWaitForFollowersNoneReturnsImmediately(t *testing.T) {
 }
 
 func TestWaitForFollowersQuorumNeedsOneOfTwoFollowers(t *testing.T) {
-	srv := NewServer(16)
+	srv := NewServer(16, nil)
 	srv.mu.Lock()
 	srv.followers["f1"] = make(chan *wal.Entry)
 	srv.followers["f2"] = make(chan *wal.Entry)
@@ -60,7 +60,7 @@ func TestWaitForFollowersQuorumNeedsOneOfTwoFollowers(t *testing.T) {
 }
 
 func TestWaitForFollowersAllNeedsEveryConnectedFollower(t *testing.T) {
-	srv := NewServer(16)
+	srv := NewServer(16, nil)
 	srv.mu.Lock()
 	srv.followers["f1"] = make(chan *wal.Entry)
 	srv.followers["f2"] = make(chan *wal.Entry)
@@ -101,7 +101,7 @@ func TestWaitForFollowersAllNeedsEveryConnectedFollower(t *testing.T) {
 }
 
 func TestWaitForFollowersAllReturnsWhenRemainingFollowersDisconnect(t *testing.T) {
-	srv := NewServer(16)
+	srv := NewServer(16, nil)
 	srv.mu.Lock()
 	srv.followers["f1"] = make(chan *wal.Entry)
 	srv.followers["f2"] = make(chan *wal.Entry)

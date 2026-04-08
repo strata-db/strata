@@ -37,28 +37,30 @@ Run this periodically (e.g. once a day) to reclaim S3 storage.`,
 			}
 			ctx := cmd.Context()
 
+			cp := checkpoint.New(logrus.StandardLogger())
+
 			// Pass 1: checkpoint GC.
-			deletedCPs, orphanSSTs, err := checkpoint.GCCheckpoints(ctx, store, keep)
+			deletedCPs, orphanSSTs, err := cp.GCCheckpoints(ctx, store, keep)
 			if err != nil {
 				return fmt.Errorf("checkpoint gc: %w", err)
 			}
 			logrus.Infof("checkpoint gc: deleted %d checkpoint(s), %d orphan SST candidate(s)", deletedCPs, len(orphanSSTs))
 
 			// Pass 2: orphan SST GC.
-			deletedSSTs, err := checkpoint.GCOrphanSSTs(ctx, store, orphanSSTs)
+			deletedSSTs, err := cp.GCOrphanSSTs(ctx, store, orphanSSTs)
 			if err != nil {
 				return fmt.Errorf("orphan sst gc: %w", err)
 			}
 			logrus.Infof("orphan sst gc: deleted %d SST file(s)", deletedSSTs)
 
 			// Pass 3: WAL segment GC — use the current manifest revision as the safe horizon.
-			manifest, err := checkpoint.ReadManifest(ctx, store)
+			manifest, err := cp.ReadManifest(ctx, store)
 			if err != nil {
 				return fmt.Errorf("read manifest: %w", err)
 			}
 			var deletedWAL int
 			if manifest != nil {
-				deletedWAL, err = wal.GCSegments(ctx, store, manifest.Revision)
+				deletedWAL, err = wal.GCSegments(ctx, store, manifest.Revision, logrus.StandardLogger())
 				if err != nil {
 					return fmt.Errorf("wal gc: %w", err)
 				}

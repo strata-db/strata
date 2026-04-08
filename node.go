@@ -16,8 +16,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 
 	"github.com/t4db/t4/internal/checkpoint"
@@ -96,6 +96,8 @@ type pendingKV struct {
 
 type Node struct {
 	cfg  Config
+	log  Logger
+	cp   *checkpoint.Manager
 	term uint64
 	role atomic.Int32 // stores nodeRole values; use loadRole/storeRole
 
@@ -160,6 +162,9 @@ func (n *Node) storeRole(r nodeRole) { n.role.Store(int32(r)) }
 func Open(cfg Config) (*Node, error) {
 	cfg.setDefaults()
 
+	log := cfg.Logger
+	cp := checkpoint.New(log)
+
 	// Wrap the object store with Prometheus instrumentation so every S3
 	// operation is counted and timed without scattering metrics calls
 	// throughout the codebase.
@@ -189,13 +194,13 @@ func Open(cfg Config) (*Node, error) {
 			defer cancel()
 			rp := cfg.RestorePoint
 			if rp.CheckpointArchive.Key != "" {
-				t, rev, err := checkpoint.RestoreVersioned(ctx, rp.Store,
+				t, rev, err := cp.RestoreVersioned(ctx, rp.Store,
 					rp.CheckpointArchive.Key, rp.CheckpointArchive.VersionID, pebbleDir)
 				if err != nil {
 					return nil, fmt.Errorf("t4: restore versioned checkpoint: %w", err)
 				}
 				term, startRev = t, rev
-				logrus.Infof("t4: versioned checkpoint restored (term=%d rev=%d)", term, startRev)
+				log.Infof("t4: versioned checkpoint restored (term=%d rev=%d)", term, startRev)
 			}
 		}
 	case cfg.BranchPoint != nil:
@@ -203,16 +208,16 @@ func Open(cfg Config) (*Node, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
 			bp := cfg.BranchPoint
-			t, rev, err := checkpoint.RestoreBranch(ctx, bp.SourceStore, nil, bp.CheckpointKey, pebbleDir)
+			t, rev, err := cp.RestoreBranch(ctx, bp.SourceStore, nil, bp.CheckpointKey, pebbleDir)
 			if err != nil {
 				return nil, fmt.Errorf("t4: restore branch point: %w", err)
 			}
 			term, startRev = t, rev
-			logrus.Infof("t4: branch checkpoint restored (term=%d rev=%d)", term, startRev)
+			log.Infof("t4: branch checkpoint restored (term=%d rev=%d)", term, startRev)
 			// Record the ancestor's SSTs so the uploader does not re-upload
 			// them; they will be referenced via AncestorSSTFiles in the index.
 			if cfg.ObjectStore != nil {
-				if idx, idxErr := checkpoint.ReadCheckpointIndex(ctx, bp.SourceStore, bp.CheckpointKey); idxErr == nil {
+				if idx, idxErr := cp.ReadCheckpointIndex(ctx, bp.SourceStore, bp.CheckpointKey); idxErr == nil {
 					inheritedSSTs = make(map[string]string, len(idx.SSTFiles))
 					for _, key := range idx.SSTFiles {
 						inheritedSSTs[filepath.Base(key)] = key
@@ -223,12 +228,12 @@ func Open(cfg Config) (*Node, error) {
 	case cfg.ObjectStore != nil:
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		manifest, err := checkpoint.ReadManifest(ctx, cfg.ObjectStore)
+		manifest, err := cp.ReadManifest(ctx, cfg.ObjectStore)
 		if err != nil {
 			return nil, fmt.Errorf("t4: read manifest: %w", err)
 		}
 		if manifest != nil {
-			logrus.Infof("t4: manifest found (rev=%d)", manifest.Revision)
+			log.Infof("t4: manifest found (rev=%d)", manifest.Revision)
 			if _, err := os.Stat(pebbleDir); errors.Is(err, os.ErrNotExist) {
 				// Retry loop: the checkpoint referenced by the manifest may
 				// have been GC'd in the window between reading the manifest
@@ -237,10 +242,10 @@ func Open(cfg Config) (*Node, error) {
 				// transition). Re-reading the manifest gives us whichever
 				// checkpoint the new leader most recently wrote.
 				for attempt := 0; ; attempt++ {
-					t, rev, rerr := checkpoint.Restore(ctx, cfg.ObjectStore, manifest.CheckpointKey, pebbleDir)
+					t, rev, rerr := cp.Restore(ctx, cfg.ObjectStore, manifest.CheckpointKey, pebbleDir)
 					if rerr == nil {
 						term, startRev = t, rev
-						logrus.Infof("t4: checkpoint restored (term=%d rev=%d)", term, startRev)
+						log.Infof("t4: checkpoint restored (term=%d rev=%d)", term, startRev)
 						break
 					}
 					if !errors.Is(rerr, object.ErrNotFound) || attempt >= 4 {
@@ -250,9 +255,9 @@ func Open(cfg Config) (*Node, error) {
 					// write a new checkpoint and update the manifest before
 					// we retry. (With a 400 ms checkpoint interval, 500 ms
 					// gives a full interval of headroom.)
-					logrus.Warnf("t4: checkpoint %q not found, re-reading manifest (attempt %d/5)", manifest.CheckpointKey, attempt+1)
+					log.Warnf("t4: checkpoint %q not found, re-reading manifest (attempt %d/5)", manifest.CheckpointKey, attempt+1)
 					time.Sleep(500 * time.Millisecond)
-					manifest, err = checkpoint.ReadManifest(ctx, cfg.ObjectStore)
+					manifest, err = cp.ReadManifest(ctx, cfg.ObjectStore)
 					if err != nil {
 						return nil, fmt.Errorf("t4: read manifest: %w", err)
 					}
@@ -269,12 +274,15 @@ func Open(cfg Config) (*Node, error) {
 	// active from the first flush/compaction. Only used when S3 is configured.
 	var sstUp *istore.SSTUploader
 	var pebbleOpts []istore.PebbleOption
+	pebbleOpts = append(pebbleOpts, func(o *pebble.Options) {
+		o.Logger = &pebbleLogger{log: log}
+	})
 	if cfg.ObjectStore != nil {
 		sstUp = istore.NewSSTUploader(cfg.ObjectStore, pebbleDir)
 		pebbleOpts = append(pebbleOpts, sstUp.PebbleOption())
 	}
 
-	db, err := istore.Open(pebbleDir, pebbleOpts...)
+	db, err := istore.Open(pebbleDir, log, pebbleOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("t4: open store: %w", err)
 	}
@@ -285,7 +293,7 @@ func Open(cfg Config) (*Node, error) {
 		reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer reconcileCancel()
 		if err := sstUp.Reconcile(reconcileCtx); err != nil {
-			logrus.Warnf("t4: SST reconcile: %v", err)
+			log.Warnf("t4: SST reconcile: %v", err)
 		}
 	}
 	// Always derive startRev from pebble's actual revision, not the checkpoint
@@ -300,13 +308,14 @@ func Open(cfg Config) (*Node, error) {
 	// ── Open WAL ─────────────────────────────────────────────────────────────
 	var uploader wal.Uploader
 	if cfg.ObjectStore != nil && cfg.PeerListenAddr == "" {
-		uploader = makeUploader(cfg.ObjectStore)
+		uploader = makeUploader(cfg.ObjectStore, log)
 	}
 
 	opts := []wal.Option{
 		wal.WithUploader(uploader),
 		wal.WithSegmentMaxSize(cfg.SegmentMaxSize),
 		wal.WithSegmentMaxAge(cfg.SegmentMaxAge),
+		wal.WithLogger(log),
 	}
 	if cfg.ObjectStore != nil && *cfg.WALSyncUpload {
 		opts = append(opts, wal.WithSyncUpload())
@@ -318,7 +327,7 @@ func Open(cfg Config) (*Node, error) {
 	}
 
 	// ── Replay local WAL ─────────────────────────────────────────────────────
-	if err := replayLocal(db, walDir, startRev); err != nil {
+	if err := replayLocal(db, walDir, startRev, log); err != nil {
 		w.Close()
 		db.Close()
 		return nil, fmt.Errorf("t4: local WAL replay: %w", err)
@@ -331,7 +340,7 @@ func Open(cfg Config) (*Node, error) {
 	case cfg.RestorePoint != nil:
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		if err := replayPinned(ctx, db, cfg.RestorePoint, startRev); err != nil {
+		if err := replayPinned(ctx, db, cfg.RestorePoint, startRev, log); err != nil {
 			w.Close()
 			db.Close()
 			return nil, fmt.Errorf("t4: pinned WAL replay: %w", err)
@@ -341,7 +350,7 @@ func Open(cfg Config) (*Node, error) {
 		if cfg.ObjectStore != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
-			if err := replayRemote(ctx, db, cfg.ObjectStore, startRev); err != nil {
+			if err := replayRemote(ctx, db, cfg.ObjectStore, startRev, log); err != nil {
 				w.Close()
 				db.Close()
 				return nil, fmt.Errorf("t4: branch WAL replay: %w", err)
@@ -369,14 +378,14 @@ func Open(cfg Config) (*Node, error) {
 		// per checkpoint interval that fires during replay.
 		for range 10 { // cap at 10 iterations; converges in 1-2 on any real cluster
 			startRevBeforeReplay := db.CurrentRevision()
-			replayErr := replayRemote(ctx, db, cfg.ObjectStore, startRevBeforeReplay)
+			replayErr := replayRemote(ctx, db, cfg.ObjectStore, startRevBeforeReplay, log)
 
 			// Always check manifest after replay, even on error: if a WAL
 			// segment was GCed mid-read replayRemote returns ErrNotFound, but
 			// that same GC event means a fresh checkpoint exists.  Re-restoring
 			// from that checkpoint is the correct recovery; returning the error
 			// directly would cause Open() to fail unnecessarily.
-			freshManifest, merr := checkpoint.ReadManifest(ctx, cfg.ObjectStore)
+			freshManifest, merr := cp.ReadManifest(ctx, cfg.ObjectStore)
 
 			if replayErr != nil {
 				// If the checkpoint has not advanced there is no recovery path —
@@ -386,7 +395,7 @@ func Open(cfg Config) (*Node, error) {
 					db.Close()
 					return nil, fmt.Errorf("t4: remote WAL replay: %w", replayErr)
 				}
-				logrus.Infof("t4: WAL replay error (%v), checkpoint advanced (%d→%d) — re-restoring to close GC gap",
+				log.Infof("t4: WAL replay error (%v), checkpoint advanced (%d→%d) — re-restoring to close GC gap",
 					replayErr, startRevBeforeReplay, freshManifest.Revision)
 			} else if merr != nil || freshManifest == nil || freshManifest.Revision <= db.CurrentRevision() {
 				// Replay succeeded and the DB is at or ahead of the latest
@@ -398,7 +407,7 @@ func Open(cfg Config) (*Node, error) {
 				break
 			} else {
 				// Replay succeeded but checkpoint advanced — silent GC holes possible.
-				logrus.Infof("t4: checkpoint advanced during WAL replay (%d→%d); re-restoring to close GC gap",
+				log.Infof("t4: checkpoint advanced during WAL replay (%d→%d); re-restoring to close GC gap",
 					startRevBeforeReplay, freshManifest.Revision)
 			}
 			db.Close()
@@ -410,7 +419,7 @@ func Open(cfg Config) (*Node, error) {
 			var newRev int64
 			manifest := freshManifest
 			for attempt := range 5 {
-				newTerm, newRev, err = checkpoint.Restore(ctx, cfg.ObjectStore, manifest.CheckpointKey, pebbleDir)
+				newTerm, newRev, err = cp.Restore(ctx, cfg.ObjectStore, manifest.CheckpointKey, pebbleDir)
 				if err == nil {
 					break
 				}
@@ -419,14 +428,14 @@ func Open(cfg Config) (*Node, error) {
 					return nil, fmt.Errorf("t4: re-restore checkpoint: %w", err)
 				}
 				time.Sleep(500 * time.Millisecond)
-				manifest, err = checkpoint.ReadManifest(ctx, cfg.ObjectStore)
+				manifest, err = cp.ReadManifest(ctx, cfg.ObjectStore)
 				if err != nil || manifest == nil {
 					w.Close()
 					return nil, fmt.Errorf("t4: re-read manifest after GC: %w", err)
 				}
 			}
 			_ = newRev // term drives WAL open; startRev is read from Pebble below
-			freshDB, rerr := istore.Open(pebbleDir, pebbleOpts...)
+			freshDB, rerr := istore.Open(pebbleDir, log, pebbleOpts...)
 			if rerr != nil {
 				w.Close()
 				return nil, fmt.Errorf("t4: reopen store after GC-gap fix: %w", rerr)
@@ -435,7 +444,7 @@ func Open(cfg Config) (*Node, error) {
 				reconcileCtx, reconcileCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 				defer reconcileCancel()
 				if err := sstUp.Reconcile(reconcileCtx); err != nil {
-					logrus.Warnf("t4: SST reconcile after GC-gap fix: %v", err)
+					log.Warnf("t4: SST reconcile after GC-gap fix: %v", err)
 				}
 			}
 			w.Close()
@@ -445,7 +454,7 @@ func Open(cfg Config) (*Node, error) {
 				return nil, fmt.Errorf("t4: reopen wal after GC-gap fix: %w", rerr)
 			}
 			db, w, term, startRev = freshDB, freshW, newTerm, freshDB.CurrentRevision()
-			logrus.Infof("t4: checkpoint refreshed to rev=%d (term=%d)", startRev, term)
+			log.Infof("t4: checkpoint refreshed to rev=%d (term=%d)", startRev, term)
 		}
 	}
 
@@ -461,6 +470,8 @@ func Open(cfg Config) (*Node, error) {
 		writeC:      make(chan *writeReq, 1024),
 		sstUploader: sstUp,
 	}
+	n.log = log
+	n.cp = cp
 	n.db.Store(db)
 	if cfg.CheckpointEntries > 0 {
 		n.checkpointTriggerC = make(chan struct{}, 1)
@@ -543,9 +554,9 @@ func (n *Node) serveMetrics(ctx context.Context, addr string) {
 		defer cancel()
 		srv.Shutdown(shutCtx)
 	}()
-	logrus.Infof("t4: metrics listening on %s", addr)
+	n.log.Infof("t4: metrics listening on %s", addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logrus.Warnf("t4: metrics server: %v", err)
+		n.log.Warnf("t4: metrics server: %v", err)
 	}
 }
 
@@ -580,11 +591,11 @@ func (n *Node) electAndStart(bgCtx context.Context) error {
 	}
 
 	n.storeRole(roleFollower)
-	cli := peer.NewClient(rec.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS)
+	cli := peer.NewClient(rec.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log)
 	n.peerCli = cli
 	n.leaderCli.Store(cli)
 	metrics.ElectionsTotal.WithLabelValues("lost").Inc()
-	logrus.Infof("t4: following leader at %s (term=%d)", rec.LeaderAddr, rec.Term)
+	n.log.Infof("t4: following leader at %s (term=%d)", rec.LeaderAddr, rec.Term)
 	return nil
 }
 
@@ -600,7 +611,7 @@ func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *ele
 	// had no uploader (follower WAL) or crashed before the upload completed.
 	// After this point, new leader writes are uploaded async (SegmentMaxAge).
 	upCtx, upCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	uploadLocalWALSegments(upCtx, walDir, n.cfg.ObjectStore)
+	uploadLocalWALSegments(upCtx, walDir, n.cfg.ObjectStore, n.log)
 	upCancel()
 
 	// Replay any remote WAL entries not yet in our Pebble. A follower that wins
@@ -618,7 +629,7 @@ func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *ele
 		cpCancel()
 
 		reCtx, reCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		if err := replayRemote(reCtx, n.db.Load(), n.cfg.ObjectStore, n.db.Load().CurrentRevision()); err != nil {
+		if err := replayRemote(reCtx, n.db.Load(), n.cfg.ObjectStore, n.db.Load().CurrentRevision(), n.log); err != nil {
 			reCancel()
 			return fmt.Errorf("t4: becomeLeader replay remote WAL: %w", err)
 		}
@@ -630,16 +641,17 @@ func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *ele
 	// nodes fail simultaneously), so uploads can be async — driven by
 	// SegmentMaxAge — without affecting write durability.
 	w2, err := wal.Open(walDir, rec.Term, n.db.Load().CurrentRevision()+1,
-		wal.WithUploader(makeUploader(n.cfg.ObjectStore)),
+		wal.WithUploader(makeUploader(n.cfg.ObjectStore, n.log)),
 		wal.WithSegmentMaxSize(n.cfg.SegmentMaxSize),
 		wal.WithSegmentMaxAge(n.cfg.SegmentMaxAge),
+		wal.WithLogger(n.log),
 	)
 	if err != nil {
 		return fmt.Errorf("t4: open WAL as leader: %w", err)
 	}
 	w2.Start(bgCtx)
 
-	peerSrv := peer.NewServer(n.cfg.PeerBufferSize)
+	peerSrv := peer.NewServer(n.cfg.PeerBufferSize, n.log)
 	lis, err := net.Listen("tcp", n.cfg.PeerListenAddr)
 	if err != nil {
 		w2.Close()
@@ -676,13 +688,13 @@ func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *ele
 
 	go func() {
 		if err := grpcSrv.Serve(lis); err != nil {
-			logrus.Warnf("t4: peer server: %v", err)
+			n.log.Warnf("t4: peer server: %v", err)
 		}
 	}()
 
 	n.updateMetrics()
 	metrics.ElectionsTotal.WithLabelValues("won").Inc()
-	logrus.Infof("t4: elected leader (term=%d, peer=%s)", rec.Term, n.cfg.PeerListenAddr)
+	n.log.Infof("t4: elected leader (term=%d, peer=%s)", rec.Term, n.cfg.PeerListenAddr)
 	go n.watchLoop(bgCtx, lock, rec.Term)
 	return nil
 }
@@ -768,11 +780,11 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 		cancel()
 		if err != nil {
 			n.fenceMu.Unlock()
-			logrus.Warnf("t4: leader watch (%s): read lock: %v", reason, err)
+			n.log.Warnf("t4: leader watch (%s): read lock: %v", reason, err)
 			return true // transient S3 error; keep running
 		}
 		if rec == nil || rec.Term != term || rec.NodeID != n.cfg.NodeID {
-			logrus.Errorf("t4: leader watch (%s): lock superseded (current: %+v) — stepping down", reason, rec)
+			n.log.Errorf("t4: leader watch (%s): lock superseded (current: %+v) — stepping down", reason, rec)
 			n.cancelBg()
 			n.fenceMu.Unlock()
 			// Stop the peer gRPC server so followers immediately lose their
@@ -791,7 +803,7 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 			if errors.Is(err, object.ErrPreconditionFailed) {
 				// Another node wrote the lock between our Read and our Touch —
 				// we have been superseded.  Step down immediately.
-				logrus.Errorf("t4: leader watch (%s): touch precondition failed — lock taken, stepping down", reason)
+				n.log.Errorf("t4: leader watch (%s): touch precondition failed — lock taken, stepping down", reason)
 				n.cancelBg()
 				n.fenceMu.Unlock()
 				if grpcSrv := n.peerGRPC; grpcSrv != nil {
@@ -800,7 +812,7 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 				return false
 			}
 			if err != nil {
-				logrus.Warnf("t4: leader watch (%s): touch lock: %v", reason, err)
+				n.log.Warnf("t4: leader watch (%s): touch lock: %v", reason, err)
 			}
 		}
 		n.fenceMu.Unlock()
@@ -817,7 +829,7 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 		case <-disconnectC:
 			// Immediate check + touch: catches TakeOver that already happened,
 			// and signals liveness to the disconnected follower.
-			logrus.Infof("t4: leader watch: follower disconnected — fencing writes and checking lock")
+			n.log.Infof("t4: leader watch: follower disconnected — fencing writes and checking lock")
 			if !fencedCheck("disconnect", true) {
 				return
 			}
@@ -835,7 +847,7 @@ func (n *Node) watchLoop(ctx context.Context, lock *election.Lock, term uint64) 
 			// If followers have (re)connected, liveness touches are no longer
 			// necessary — stop polling and rely on the periodic ticker.
 			if n.peerSrv != nil && n.peerSrv.ConnectedFollowers() > 0 {
-				logrus.Debugf("t4: leader watch: followers connected — pausing liveness poll")
+				n.log.Debugf("t4: leader watch: followers connected — pausing liveness poll")
 				stopPolling()
 			}
 
@@ -905,7 +917,7 @@ func (n *Node) followLoop(bgCtx context.Context) {
 		if peer.IsResyncRequired(err) {
 			metrics.FollowerResyncsTotal.WithLabelValues("stream_gap").Inc()
 			if n.cfg.ObjectStore == nil {
-				logrus.Error("t4: follower resync required but no object store — restart node")
+				n.log.Errorf("t4: follower resync required but no object store — restart node")
 				n.cancelBg()
 				return
 			}
@@ -913,17 +925,17 @@ func (n *Node) followLoop(bgCtx context.Context) {
 			// the leader's ring buffer no longer covers fromRev. Restore from
 			// the latest S3 checkpoint (if the follower's Pebble is behind it),
 			// then replay any remaining WAL entries from S3.
-			logrus.Warn("t4: follower resync required — restoring from checkpoint")
+			n.log.Warnf("t4: follower resync required — restoring from checkpoint")
 			if cpErr := n.resyncFromCheckpoint(bgCtx); cpErr != nil {
-				logrus.Errorf("t4: follower in-place resync failed: %v — cancelling", cpErr)
+				n.log.Errorf("t4: follower in-place resync failed: %v — cancelling", cpErr)
 				n.cancelBg()
 				return
 			}
 			reCtx, reCancel := context.WithTimeout(bgCtx, 5*time.Minute)
-			rerr := replayRemote(reCtx, n.db.Load(), n.cfg.ObjectStore, n.db.Load().CurrentRevision())
+			rerr := replayRemote(reCtx, n.db.Load(), n.cfg.ObjectStore, n.db.Load().CurrentRevision(), n.log)
 			reCancel()
 			if rerr != nil {
-				logrus.Errorf("t4: follower S3 resync failed: %v — retrying", rerr)
+				n.log.Errorf("t4: follower S3 resync failed: %v — retrying", rerr)
 				select {
 				case <-time.After(2 * time.Second):
 				case <-bgCtx.Done():
@@ -936,16 +948,16 @@ func (n *Node) followLoop(bgCtx context.Context) {
 				// not broadcast, so without this they would sleep until the
 				// next live Apply — causing unnecessary read latency.
 				n.db.Load().NotifyRevision()
-				logrus.Infof("t4: follower resync complete (now at rev=%d)", n.db.Load().CurrentRevision())
+				n.log.Infof("t4: follower resync complete (now at rev=%d)", n.db.Load().CurrentRevision())
 			}
 			continue
 		}
 
 		if peer.IsLeaderUnreachable(err) || peer.IsLeaderShutdown(err) {
 			if peer.IsLeaderShutdown(err) {
-				logrus.Info("t4: leader shut down gracefully — attempting immediate election takeover")
+				n.log.Infof("t4: leader shut down gracefully — attempting immediate election takeover")
 			} else {
-				logrus.Warn("t4: leader unreachable — attempting election takeover")
+				n.log.Warnf("t4: leader unreachable — attempting election takeover")
 			}
 			newCli, promoted := n.attemptPromotion(bgCtx, lock, peer.IsLeaderShutdown(err))
 			if promoted {
@@ -956,12 +968,12 @@ func (n *Node) followLoop(bgCtx context.Context) {
 				cli = newCli
 				n.leaderCli.Store(newCli)
 				oldCli.Close()
-				logrus.Infof("t4: following new leader")
+				n.log.Infof("t4: following new leader")
 			}
 			continue
 		}
 
-		logrus.Warnf("t4: follow loop error (will retry): %v", err)
+		n.log.Warnf("t4: follow loop error (will retry): %v", err)
 		select {
 		case <-time.After(2 * time.Second):
 		case <-bgCtx.Done():
@@ -991,17 +1003,17 @@ func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock, grac
 	// so its fresh LastSeenNano must not block election.
 	existing, err := lock.Read(ctx)
 	if err != nil {
-		logrus.Errorf("t4: takeover: read lock: %v", err)
+		n.log.Errorf("t4: takeover: read lock: %v", err)
 		return nil, false
 	}
 	if !graceful && existing != nil && existing.LastSeenNano > 0 {
 		age := time.Since(time.Unix(0, existing.LastSeenNano))
 		if age < peer.LeaderLivenessTTL {
-			logrus.Infof("t4: takeover: leader liveness is fresh (%v ago) — backing off to avoid split-brain", age.Round(time.Millisecond))
+			n.log.Infof("t4: takeover: leader liveness is fresh (%v ago) — backing off to avoid split-brain", age.Round(time.Millisecond))
 			// Back off from election, but do not keep retrying a stale endpoint.
 			// If the lock advertises a leader address, switch followLoop to it.
 			if existing.LeaderAddr != "" {
-				return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS), false
+				return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log), false
 			}
 			return nil, false
 		}
@@ -1013,23 +1025,23 @@ func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock, grac
 	// followLoop switches to following them — connecting will trigger an
 	// in-place resync that catches up this node's revision.
 	if existing != nil && existing.CommittedRev > n.db.Load().CurrentRevision() {
-		logrus.Infof("t4: takeover: node is behind leader committed rev (ours=%d, leader=%d) — following current leader to catch up",
+		n.log.Infof("t4: takeover: node is behind leader committed rev (ours=%d, leader=%d) — following current leader to catch up",
 			n.db.Load().CurrentRevision(), existing.CommittedRev)
 		if existing.LeaderAddr != "" {
-			return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS), false
+			return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log), false
 		}
 		return nil, false
 	}
 
 	rec, won, err := lock.TakeOver(ctx, n.term, n.db.Load().CurrentRevision())
 	if err != nil {
-		logrus.Errorf("t4: takeover election error: %v", err)
+		n.log.Errorf("t4: takeover election error: %v", err)
 		return nil, false
 	}
 
 	if won {
 		if err := n.becomeLeader(bgCtx, lock, rec); err != nil {
-			logrus.Errorf("t4: promotion failed: %v", err)
+			n.log.Errorf("t4: promotion failed: %v", err)
 			return nil, false
 		}
 		// Start write-processing loops immediately so that client writes are
@@ -1051,7 +1063,7 @@ func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock, grac
 		if n.sstUploader != nil {
 			rCtx, rCancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			if rErr := n.sstUploader.Reconcile(rCtx); rErr != nil {
-				logrus.Warnf("t4: promoted leader SST reconcile: %v", rErr)
+				n.log.Warnf("t4: promoted leader SST reconcile: %v", rErr)
 			}
 			rCancel()
 			n.sstUploader.Start(bgCtx)
@@ -1069,8 +1081,8 @@ func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock, grac
 	}
 
 	if rec != nil && rec.LeaderAddr != "" {
-		logrus.Infof("t4: lost election to %s (term=%d) — following", rec.NodeID, rec.Term)
-		return peer.NewClient(rec.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS), false
+		n.log.Infof("t4: lost election to %s (term=%d) — following", rec.NodeID, rec.Term)
+		return peer.NewClient(rec.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log), false
 	}
 	return nil, false
 }
@@ -1332,7 +1344,7 @@ func (n *Node) Close() error {
 		n.readMu.Lock()
 		n.readMu.Unlock()
 		if werr := n.wal.Close(); werr != nil {
-			logrus.Errorf("t4: wal close: %v", werr)
+			n.log.Errorf("t4: wal close: %v", werr)
 			err = werr
 		}
 		// Intentionally do NOT delete the election lock on shutdown.
@@ -1972,7 +1984,7 @@ func (n *Node) Watch(ctx context.Context, prefix string, startRev int64) (<-chan
 // not yet present in S3. This is called when becoming leader so that local
 // entries (recovered via replayLocal) are durable in object storage before
 // followers can bootstrap.
-func uploadLocalWALSegments(ctx context.Context, walDir string, store object.Store) {
+func uploadLocalWALSegments(ctx context.Context, walDir string, store object.Store, log Logger) {
 	paths, err := wal.LocalSegments(walDir)
 	if err != nil || len(paths) == 0 {
 		return
@@ -1985,7 +1997,7 @@ func uploadLocalWALSegments(ctx context.Context, walDir string, store object.Sto
 		inS3[k] = struct{}{}
 	}
 
-	up := makeUploader(store)
+	up := makeUploader(store, log)
 	for _, path := range paths {
 		term, firstRev, ok := wal.ParseSegmentName(filepath.Base(path))
 		if !ok {
@@ -1996,7 +2008,7 @@ func uploadLocalWALSegments(ctx context.Context, walDir string, store object.Sto
 			continue // already uploaded
 		}
 		if err := up(ctx, path, objKey); err != nil {
-			logrus.Warnf("t4: pre-leader upload %q → %q: %v", path, objKey, err)
+			log.Warnf("t4: pre-leader upload %q → %q: %v", path, objKey, err)
 		}
 	}
 }
@@ -2036,30 +2048,30 @@ func (n *Node) forceCheckpoint(ctx context.Context) {
 	}
 	if err := n.wal.SealAndFlush(rev + 1); err != nil {
 		n.fenceMu.Unlock()
-		logrus.Errorf("t4: startup checkpoint seal WAL: %v", err)
+		n.log.Errorf("t4: startup checkpoint seal WAL: %v", err)
 		return
 	}
 	if err := n.db.Load().Flush(); err != nil {
 		n.fenceMu.Unlock()
-		logrus.Errorf("t4: startup checkpoint flush pebble: %v", err)
+		n.log.Errorf("t4: startup checkpoint flush pebble: %v", err)
 		return
 	}
 	if n.sstUploader != nil {
 		n.sstUploader.Wait()
-		if err := checkpoint.WriteWithRegistry(ctx, n.db.Load().Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.sstUploader.Registry(), n.sstUploader.InheritedRegistry()); err != nil {
+		if err := n.cp.WriteWithRegistry(ctx, n.db.Load().Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.sstUploader.Registry(), n.sstUploader.InheritedRegistry()); err != nil {
 			n.fenceMu.Unlock()
-			logrus.Errorf("t4: startup checkpoint rev=%d: %v", rev, err)
+			n.log.Errorf("t4: startup checkpoint rev=%d: %v", rev, err)
 			return
 		}
-	} else if err := checkpoint.Write(ctx, n.db.Load().Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.cfg.AncestorStore); err != nil {
+	} else if err := n.cp.Write(ctx, n.db.Load().Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.cfg.AncestorStore); err != nil {
 		n.fenceMu.Unlock()
-		logrus.Errorf("t4: startup checkpoint rev=%d: %v", rev, err)
+		n.log.Errorf("t4: startup checkpoint rev=%d: %v", rev, err)
 		return
 	}
 	n.fenceMu.Unlock()
 	atomic.StoreInt64(&n.entriesSinceCheckpoint, 0)
 	metrics.CheckpointsTotal.Inc()
-	logrus.Infof("t4: startup checkpoint written (rev=%d)", rev)
+	n.log.Infof("t4: startup checkpoint written (rev=%d)", rev)
 }
 
 func (n *Node) maybeCheckpoint(ctx context.Context) {
@@ -2074,30 +2086,30 @@ func (n *Node) maybeCheckpoint(ctx context.Context) {
 	}
 	if err := n.wal.SealAndFlush(rev + 1); err != nil {
 		n.fenceMu.Unlock()
-		logrus.Errorf("t4: checkpoint seal WAL: %v", err)
+		n.log.Errorf("t4: checkpoint seal WAL: %v", err)
 		return
 	}
 	if err := n.db.Load().Flush(); err != nil {
 		n.fenceMu.Unlock()
-		logrus.Errorf("t4: checkpoint flush pebble: %v", err)
+		n.log.Errorf("t4: checkpoint flush pebble: %v", err)
 		return
 	}
 	if n.sstUploader != nil {
 		n.sstUploader.Wait()
-		if err := checkpoint.WriteWithRegistry(ctx, n.db.Load().Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.sstUploader.Registry(), n.sstUploader.InheritedRegistry()); err != nil {
+		if err := n.cp.WriteWithRegistry(ctx, n.db.Load().Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.sstUploader.Registry(), n.sstUploader.InheritedRegistry()); err != nil {
 			n.fenceMu.Unlock()
-			logrus.Errorf("t4: write checkpoint rev=%d: %v", rev, err)
+			n.log.Errorf("t4: write checkpoint rev=%d: %v", rev, err)
 			return
 		}
-	} else if err := checkpoint.Write(ctx, n.db.Load().Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.cfg.AncestorStore); err != nil {
+	} else if err := n.cp.Write(ctx, n.db.Load().Pebble(), n.cfg.ObjectStore, n.term, rev, "", n.cfg.AncestorStore); err != nil {
 		n.fenceMu.Unlock()
-		logrus.Errorf("t4: write checkpoint rev=%d: %v", rev, err)
+		n.log.Errorf("t4: write checkpoint rev=%d: %v", rev, err)
 		return
 	}
 	n.fenceMu.Unlock()
 	atomic.StoreInt64(&n.entriesSinceCheckpoint, 0)
 	metrics.CheckpointsTotal.Inc()
-	logrus.Infof("t4: checkpoint written (rev=%d)", rev)
+	n.log.Infof("t4: checkpoint written (rev=%d)", rev)
 
 	// GC WAL segments from S3 that are fully covered by this checkpoint AND
 	// that all connected followers have applied. Using min(leaderRev,
@@ -2111,12 +2123,12 @@ func (n *Node) maybeCheckpoint(ctx context.Context) {
 			gcRev = minFollower
 		}
 	}
-	deleted, gcErr := wal.GCSegments(gcCtx, n.cfg.ObjectStore, gcRev)
+	deleted, gcErr := wal.GCSegments(gcCtx, n.cfg.ObjectStore, gcRev, n.log)
 	if gcErr != nil {
-		logrus.Warnf("t4: wal gc: %v", gcErr)
+		n.log.Warnf("t4: wal gc: %v", gcErr)
 	} else if deleted > 0 {
 		metrics.WALGCTotal.Add(float64(deleted))
-		logrus.Infof("t4: wal gc: deleted %d segments (covered by checkpoint rev=%d)", deleted, gcRev)
+		n.log.Infof("t4: wal gc: deleted %d segments (covered by checkpoint rev=%d)", deleted, gcRev)
 	}
 
 	// GC old checkpoint archives from S3, keeping the 2 most recent so that
@@ -2128,22 +2140,22 @@ func (n *Node) maybeCheckpoint(ctx context.Context) {
 	// eliminates the race where a newly-promoted leader uploads SSTs before
 	// writing its first checkpoint — those SSTs never appear in any deleted
 	// checkpoint's index, so they are never mistakenly treated as orphans.
-	cpDeleted, orphanSSTs, cpGCErr := checkpoint.GCCheckpoints(gcCtx, n.cfg.ObjectStore, 2)
+	cpDeleted, orphanSSTs, cpGCErr := n.cp.GCCheckpoints(gcCtx, n.cfg.ObjectStore, 2)
 	if cpGCErr != nil {
-		logrus.Warnf("t4: checkpoint gc: %v", cpGCErr)
+		n.log.Warnf("t4: checkpoint gc: %v", cpGCErr)
 	} else if cpDeleted > 0 {
-		logrus.Infof("t4: checkpoint gc: deleted %d old checkpoint(s)", cpDeleted)
+		n.log.Infof("t4: checkpoint gc: deleted %d old checkpoint(s)", cpDeleted)
 	}
 
 	// Only run SST GC when old checkpoints were actually deleted and there are
 	// candidate SSTs to clean up. This skips the Delete loop entirely when
 	// nothing changed, which is the common case.
 	if cpDeleted > 0 && len(orphanSSTs) > 0 {
-		sstDeleted, sstGCErr := checkpoint.GCOrphanSSTs(gcCtx, n.cfg.ObjectStore, orphanSSTs)
+		sstDeleted, sstGCErr := n.cp.GCOrphanSSTs(gcCtx, n.cfg.ObjectStore, orphanSSTs)
 		if sstGCErr != nil {
-			logrus.Warnf("t4: sst gc: %v", sstGCErr)
+			n.log.Warnf("t4: sst gc: %v", sstGCErr)
 		} else if sstDeleted > 0 {
-			logrus.Infof("t4: sst gc: deleted %d orphan sst(s)", sstDeleted)
+			n.log.Infof("t4: sst gc: deleted %d orphan sst(s)", sstDeleted)
 		}
 	}
 }
@@ -2161,7 +2173,7 @@ func toKV(sv *istore.KeyValue) *KeyValue {
 	}
 }
 
-func makeUploader(obj object.Store) wal.Uploader {
+func makeUploader(obj object.Store, log Logger) wal.Uploader {
 	return func(ctx context.Context, localPath, objectKey string) error {
 		f, err := os.Open(localPath)
 		if err != nil {
@@ -2177,11 +2189,11 @@ func makeUploader(obj object.Store) wal.Uploader {
 			chkCancel()
 			if s3Err == nil {
 				rc.Close()
-				logrus.Debugf("uploader: local file %q already gone but %q exists in S3 — treating as success", localPath, objectKey)
+				log.Debugf("uploader: local file %q already gone but %q exists in S3 — treating as success", localPath, objectKey)
 				return nil
 			}
 			metrics.WALUploadErrors.Inc()
-			logrus.Errorf("uploader: local file %q is gone AND %q is not in S3 — segment data is lost", localPath, objectKey)
+			log.Errorf("uploader: local file %q is gone AND %q is not in S3 — segment data is lost", localPath, objectKey)
 			return fmt.Errorf("uploader: open %q: %w", localPath, err)
 		}
 		defer f.Close()
@@ -2196,7 +2208,7 @@ func makeUploader(obj object.Store) wal.Uploader {
 	}
 }
 
-func replayLocal(db *istore.Store, walDir string, afterRev int64) error {
+func replayLocal(db *istore.Store, walDir string, afterRev int64, log Logger) error {
 	paths, err := wal.LocalSegments(walDir)
 	if err != nil {
 		return err
@@ -2209,7 +2221,7 @@ func replayLocal(db *istore.Store, walDir string, afterRev int64) error {
 		entries, readErr := sr.ReadAll()
 		closer()
 		if readErr != nil {
-			logrus.Warnf("t4: partial local segment %q: %v", path, readErr)
+			log.Warnf("t4: partial local segment %q: %v", path, readErr)
 		}
 		var applicable []wal.Entry
 		for _, e := range entries {
@@ -2228,7 +2240,7 @@ func replayLocal(db *istore.Store, walDir string, afterRev int64) error {
 
 // replayPinned replays the specific WAL segments listed in rp, applying
 // entries with revision > afterRev. Used during RestorePoint bootstrap.
-func replayPinned(ctx context.Context, db *istore.Store, rp *RestorePoint, afterRev int64) error {
+func replayPinned(ctx context.Context, db *istore.Store, rp *RestorePoint, afterRev int64, log Logger) error {
 	for _, seg := range rp.WALSegments {
 		rc, err := rp.Store.GetVersioned(ctx, seg.Key, seg.VersionID)
 		if err != nil {
@@ -2242,7 +2254,7 @@ func replayPinned(ctx context.Context, db *istore.Store, rp *RestorePoint, after
 		entries, readErr := sr.ReadAll()
 		rc.Close()
 		if readErr != nil {
-			logrus.Warnf("t4: partial pinned segment %q: %v", seg.Key, readErr)
+			log.Warnf("t4: partial pinned segment %q: %v", seg.Key, readErr)
 		}
 		var applicable []wal.Entry
 		for _, e := range entries {
@@ -2272,14 +2284,14 @@ func replayPinned(ctx context.Context, db *istore.Store, rp *RestorePoint, after
 // Returns (false, nil) when no restore was needed (already at or above
 // the latest checkpoint revision).
 func (n *Node) restoreDBIfBehindCheckpoint(ctx context.Context) (bool, error) {
-	manifest, err := checkpoint.ReadManifest(ctx, n.cfg.ObjectStore)
+	manifest, err := n.cp.ReadManifest(ctx, n.cfg.ObjectStore)
 	if err != nil {
 		return false, fmt.Errorf("read manifest: %w", err)
 	}
 	if manifest == nil || manifest.Revision <= n.db.Load().CurrentRevision() {
 		return false, nil // already at or above checkpoint
 	}
-	logrus.Infof("t4: node at rev=%d is behind checkpoint rev=%d — restoring in place",
+	n.log.Infof("t4: node at rev=%d is behind checkpoint rev=%d — restoring in place",
 		n.db.Load().CurrentRevision(), manifest.Revision)
 
 	pebbleDir := filepath.Join(n.cfg.DataDir, "db")
@@ -2289,7 +2301,7 @@ func (n *Node) restoreDBIfBehindCheckpoint(ctx context.Context) (bool, error) {
 	var newTerm uint64
 	for attempt := 0; ; attempt++ {
 		os.RemoveAll(tmpDir)
-		t, _, rerr := checkpoint.Restore(ctx, n.cfg.ObjectStore, manifest.CheckpointKey, tmpDir)
+		t, _, rerr := n.cp.Restore(ctx, n.cfg.ObjectStore, manifest.CheckpointKey, tmpDir)
 		if rerr == nil {
 			newTerm = t
 			break
@@ -2300,10 +2312,10 @@ func (n *Node) restoreDBIfBehindCheckpoint(ctx context.Context) (bool, error) {
 		}
 		// Checkpoint was GC'd between manifest read and restore — re-read
 		// the manifest so we target whatever the leader most recently wrote.
-		logrus.Warnf("t4: checkpoint %q not found during restore, re-reading manifest (attempt %d/5)",
+		n.log.Warnf("t4: checkpoint %q not found during restore, re-reading manifest (attempt %d/5)",
 			manifest.CheckpointKey, attempt+1)
 		time.Sleep(500 * time.Millisecond)
-		manifest, err = checkpoint.ReadManifest(ctx, n.cfg.ObjectStore)
+		manifest, err = n.cp.ReadManifest(ctx, n.cfg.ObjectStore)
 		if err != nil {
 			os.RemoveAll(tmpDir)
 			return false, fmt.Errorf("re-read manifest: %w", err)
@@ -2345,7 +2357,7 @@ func (n *Node) restoreDBIfBehindCheckpoint(ctx context.Context) (bool, error) {
 		os.RemoveAll(tmpDir)
 		return false, fmt.Errorf("rename resync dir: %w", rerr)
 	}
-	newDB, rerr := istore.Open(pebbleDir)
+	newDB, rerr := istore.Open(pebbleDir, n.log)
 	if rerr != nil {
 		n.readMu.Unlock()
 		n.fenceMu.Unlock()
@@ -2381,11 +2393,12 @@ func (n *Node) resyncFromCheckpoint(bgCtx context.Context) error {
 	newRev := n.db.Load().CurrentRevision()
 	n.wal.Close()
 	if rerr := os.RemoveAll(walDir); rerr != nil {
-		logrus.Warnf("t4: remove old wal dir during resync: %v", rerr)
+		n.log.Warnf("t4: remove old wal dir during resync: %v", rerr)
 	}
 	newWal, rerr := wal.Open(walDir, n.term, newRev+1,
 		wal.WithSegmentMaxSize(n.cfg.SegmentMaxSize),
 		wal.WithSegmentMaxAge(n.cfg.SegmentMaxAge),
+		wal.WithLogger(n.log),
 	)
 	if rerr != nil {
 		return fmt.Errorf("open new wal after resync: %w", rerr)
@@ -2397,11 +2410,11 @@ func (n *Node) resyncFromCheckpoint(bgCtx context.Context) error {
 	n.nextRev = newRev
 	n.mu.Unlock()
 
-	logrus.Infof("t4: follower in-place resync complete (rev=%d term=%d)", newRev, n.term)
+	n.log.Infof("t4: follower in-place resync complete (rev=%d term=%d)", newRev, n.term)
 	return nil
 }
 
-func replayRemote(ctx context.Context, db *istore.Store, obj object.Store, afterRev int64) error {
+func replayRemote(ctx context.Context, db *istore.Store, obj object.Store, afterRev int64, log Logger) error {
 	keys, err := obj.List(ctx, "wal/")
 	if err != nil {
 		return err
@@ -2437,7 +2450,7 @@ func replayRemote(ctx context.Context, db *istore.Store, obj object.Store, after
 		entries, readErr := sr.ReadAll()
 		rc.Close()
 		if readErr != nil {
-			logrus.Warnf("t4: partial remote segment %q: %v", key, readErr)
+			log.Warnf("t4: partial remote segment %q: %v", key, readErr)
 		}
 		for _, e := range entries {
 			if e.Revision <= afterRev {
