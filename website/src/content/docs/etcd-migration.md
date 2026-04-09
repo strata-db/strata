@@ -18,7 +18,7 @@ T4 supports the following etcd v3 operations:
 | `Range` (Get / List / prefix scan)                                                  | Full                                                                                                                                                      |
 | `Put`                                                                               | Full                                                                                                                                                      |
 | `DeleteRange` (single key or prefix/range)                                          | Full                                                                                                                                                      |
-| `Txn` (compare-and-set, unconditional)                                              | Supported: single-key MOD==0 (create-if-not-exists), MOD==X (CAS update/delete), and unconditional (no-compare) ops; multi-key transactions not supported |
+| `Txn` (compare-and-set, unconditional)                                              | Full multi-key support: arbitrary `If` conditions (MOD, CREATE, VALUE, LEASE, VERSION==0/!=0), multi-key `Then`/`Else` branches with Put and Delete ops; nested `RequestTxn` and range-delete ops within branches return `Unimplemented` |
 | `Watch`                                                                             | Full (history replay, cancel)                                                                                                                             |
 | `Compact`                                                                           | Full                                                                                                                                                      |
 | `LeaseGrant` / `LeaseKeepAlive` / `LeaseRevoke` / `LeaseTimeToLive` / `LeaseLeases` | Full                                                                                                                                                      |
@@ -155,7 +155,7 @@ Key API differences from the etcd v3 Go client:
 | `cli.Put(ctx, key, value)`                | `node.Put(ctx, key, []byte(value), 0)`                                                                                                                  |
 | `cli.Delete(ctx, key)`                    | `node.Delete(ctx, key)`                                                                                                                                 |
 | `cli.Watch(ctx, prefix, WithPrefix())`    | `node.Watch(ctx, prefix, 0)`                                                                                                                            |
-| `cli.Txn(ctx).If(...).Then(Put).Commit()` | `node.Create` / `node.Update` / `node.DeleteIfRevision`                                                                                                 |
+| `cli.Txn(ctx).If(...).Then(Put).Commit()` | `node.Txn(ctx, t4.TxnRequest{Conditions: [...], Success: [...], Failure: [...]})` — full multi-key If/Then/Else with Put and Delete ops; or `node.Create` / `node.Update` / `node.DeleteIfRevision` for simple single-key CAS patterns |
 | `cli.Grant(ctx, ttl)` + lease ID on Put   | `node.Put(ctx, key, value, leaseID)` — obtain a lease ID from `LeaseGrant` via the etcd gRPC API, or manage leases directly through the embedded server |
 
 ---
@@ -164,7 +164,7 @@ Key API differences from the etcd v3 Go client:
 
 | etcd feature                                                    | T4 behaviour                            | Workaround                                                     |
 |-----------------------------------------------------------------|-----------------------------------------|----------------------------------------------------------------|
-| Multi-key transactions                                          | Not supported — returns `Unimplemented` | Decompose into individual `Create` / `Update` / `Delete` calls |
+| Multi-key transactions                                          | Supported — see `node.Txn` and etcd `Txn` RPC | —                                                              |
 | Maintenance RPCs (Alarm, Hash, Snapshot, MoveLeader)            | Not supported                           | Not needed for standard application clients                    |
 | `etcdctl snapshot restore`                                      | Not supported                           | Use `t4 branch fork` for point-in-time copies                  |
 | `MemberAdd` / `MemberRemove` / `MemberUpdate` / `MemberPromote` | Not supported                           | Not needed for standard clients                                |
