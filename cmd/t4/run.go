@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
@@ -18,6 +21,7 @@ import (
 	"github.com/t4db/t4"
 	t4etcd "github.com/t4db/t4/etcd"
 	"github.com/t4db/t4/etcd/auth"
+	"github.com/t4db/t4/internal/metrics"
 )
 
 func runCmd() *cobra.Command {
@@ -120,7 +124,6 @@ func runCmd() *cobra.Command {
 				LeaderWatchInterval: time.Duration(leaderWatchIntervalSec) * time.Second,
 				FollowerMaxRetries:  followerMaxRetries,
 				FollowerWaitMode:    t4.FollowerWaitMode(followerWaitMode),
-				MetricsAddr:         metricsAddr,
 			}
 
 			if walSyncUpload != "" {
@@ -177,6 +180,9 @@ func runCmd() *cobra.Command {
 				"node_id":     resolvedNodeID(nodeID),
 				"revision":    node.CurrentRevision(),
 			}).Info("t4 node opened")
+
+			// ── Observability ─────────────────────────────────────────────────
+			go serveMetrics(cmd.Context(), metricsAddr, node)
 
 			// ── Auth setup ───────────────────────────────────────────────────
 			var (
@@ -270,7 +276,7 @@ func runCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&authEnabled, "auth-enabled", false, "enable etcd-compatible authentication and RBAC")
 	cmd.Flags().IntVar(&tokenTTLSec, "token-ttl", 300, "bearer token TTL in seconds")
 	// observability
-	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "", "HTTP address for /metrics, /healthz, /readyz (e.g. 0.0.0.0:9090)")
+	cmd.Flags().StringVar(&metricsAddr, "metrics-addr", "0.0.0.0:9090", "HTTP address for /metrics, /healthz, /readyz (e.g. 0.0.0.0:9090)")
 	// branch node
 	cmd.Flags().StringVar(&branchSourceBucket, "branch-source-bucket", "", "S3 bucket of the source node to branch from")
 	cmd.Flags().StringVar(&branchSourcePrefix, "branch-source-prefix", "", "S3 key prefix of the source node")
@@ -455,4 +461,37 @@ func buildPeerTLS(ca, cert, key string) (serverCreds, clientCreds credentials.Tr
 		MinVersion:   tls.VersionTLS13,
 	}
 	return credentials.NewTLS(serverTLS), credentials.NewTLS(clientTLS), nil
+}
+
+func serveMetrics(ctx context.Context, addr string, node *t4.Node) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Gatherer(), promhttp.HandlerOpts{}))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/healthz/leader", func(w http.ResponseWriter, _ *http.Request) {
+		if node.IsLeader() {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, "not leader", http.StatusServiceUnavailable)
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if node.CurrentRevision() >= 0 {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+		}
+	})
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(shutCtx) //nolint:errcheck
+	}()
+	logrus.Infof("t4: metrics listening on %s", addr)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logrus.Warnf("t4: metrics server: %v", err)
+	}
 }

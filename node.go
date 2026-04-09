@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,7 +16,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 
 	"github.com/t4db/t4/internal/checkpoint"
@@ -521,47 +519,8 @@ func Open(cfg Config) (*Node, error) {
 
 	// ── Observability ─────────────────────────────────────────────────────────
 	n.updateMetrics()
-	if cfg.MetricsAddr != "" {
-		go n.serveMetrics(bgCtx, cfg.MetricsAddr)
-	}
 
 	return n, nil
-}
-
-// serveMetrics starts an HTTP server exposing /metrics, /healthz, /readyz,
-// and /healthz/leader (used by Envoy active health checks to identify the leader).
-func (n *Node) serveMetrics(ctx context.Context, addr string) {
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Gatherer(), promhttp.HandlerOpts{}))
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.HandleFunc("/healthz/leader", func(w http.ResponseWriter, _ *http.Request) {
-		r := n.loadRole()
-		if r == roleLeader || r == roleSingle {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		http.Error(w, "not leader", http.StatusServiceUnavailable)
-	})
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if n.db.Load().CurrentRevision() >= 0 {
-			w.WriteHeader(http.StatusOK)
-		} else {
-			http.Error(w, "not ready", http.StatusServiceUnavailable)
-		}
-	})
-	srv := &http.Server{Addr: addr, Handler: mux}
-	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		srv.Shutdown(shutCtx)
-	}()
-	n.log.Infof("t4: metrics listening on %s", addr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		n.log.Warnf("t4: metrics server: %v", err)
-	}
 }
 
 // updateMetrics refreshes the role and revision gauges.
