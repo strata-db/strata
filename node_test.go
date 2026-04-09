@@ -3,6 +3,8 @@ package t4_test
 import (
 	"context"
 	"errors"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -437,4 +439,341 @@ func TestNodeRestart(t *testing.T) {
 	if string(kv.Value) != "yes" {
 		t.Errorf("value after restart: want yes got %q", kv.Value)
 	}
+}
+
+// ── Txn ───────────────────────────────────────────────────────────────────────
+
+func TestTxnMultiKeyAtomicPut(t *testing.T) {
+	n := openNode(t)
+
+	resp, err := n.Txn(ctx(t), t4.TxnRequest{
+		Success: []t4.TxnOp{
+			{Type: t4.TxnPut, Key: "a", Value: []byte("1")},
+			{Type: t4.TxnPut, Key: "b", Value: []byte("2")},
+			{Type: t4.TxnPut, Key: "c", Value: []byte("3")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Txn: %v", err)
+	}
+	if !resp.Succeeded {
+		t.Error("Txn: want Succeeded=true")
+	}
+	rev := resp.Revision
+
+	// All three keys must share the same revision.
+	for key, want := range map[string]string{"a": "1", "b": "2", "c": "3"} {
+		kv, err := n.Get(key)
+		if err != nil || kv == nil {
+			t.Fatalf("Get(%q): err=%v kv=%v", key, err, kv)
+		}
+		if string(kv.Value) != want {
+			t.Errorf("Get(%q): want %q got %q", key, want, kv.Value)
+		}
+		if kv.Revision != rev {
+			t.Errorf("Get(%q).Revision: want %d got %d", key, rev, kv.Revision)
+		}
+		if kv.CreateRevision != rev {
+			t.Errorf("Get(%q).CreateRevision: want %d got %d", key, rev, kv.CreateRevision)
+		}
+	}
+}
+
+func TestTxnConditionSucceeded(t *testing.T) {
+	n := openNode(t)
+
+	// Pre-create key a.
+	aRev, err := n.Put(ctx(t), "a", []byte("old"), 0)
+	if err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Txn: if a.ModRevision == aRev, update a and create b.
+	resp, err := n.Txn(ctx(t), t4.TxnRequest{
+		Conditions: []t4.TxnCondition{
+			{Key: "a", Target: t4.TxnCondMod, Result: t4.TxnCondEqual, ModRevision: aRev},
+		},
+		Success: []t4.TxnOp{
+			{Type: t4.TxnPut, Key: "a", Value: []byte("new")},
+			{Type: t4.TxnPut, Key: "b", Value: []byte("created")},
+		},
+		Failure: []t4.TxnOp{
+			{Type: t4.TxnPut, Key: "b", Value: []byte("fallback")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Txn: %v", err)
+	}
+	if !resp.Succeeded {
+		t.Error("Txn: want Succeeded=true")
+	}
+
+	aKV, _ := n.Get("a")
+	bKV, _ := n.Get("b")
+	if aKV == nil || string(aKV.Value) != "new" {
+		t.Errorf("a: want new got %v", aKV)
+	}
+	if bKV == nil || string(bKV.Value) != "created" {
+		t.Errorf("b: want created got %v", bKV)
+	}
+	if aKV != nil && bKV != nil && aKV.Revision != bKV.Revision {
+		t.Errorf("a and b must share revision: a=%d b=%d", aKV.Revision, bKV.Revision)
+	}
+}
+
+func TestTxnConditionFailed(t *testing.T) {
+	n := openNode(t)
+
+	_, _ = n.Put(ctx(t), "a", []byte("v1"), 0)
+	// Give a a second revision so it no longer matches ModRevision==0.
+	_, _ = n.Put(ctx(t), "a", []byte("v2"), 0)
+
+	resp, err := n.Txn(ctx(t), t4.TxnRequest{
+		Conditions: []t4.TxnCondition{
+			{Key: "a", Target: t4.TxnCondMod, Result: t4.TxnCondEqual, ModRevision: 0},
+		},
+		Success: []t4.TxnOp{{Type: t4.TxnPut, Key: "result", Value: []byte("success")}},
+		Failure: []t4.TxnOp{{Type: t4.TxnPut, Key: "result", Value: []byte("failure")}},
+	})
+	if err != nil {
+		t.Fatalf("Txn: %v", err)
+	}
+	if resp.Succeeded {
+		t.Error("Txn: want Succeeded=false")
+	}
+
+	kv, _ := n.Get("result")
+	if kv == nil || string(kv.Value) != "failure" {
+		t.Errorf("result: want failure got %v", kv)
+	}
+}
+
+func TestTxnDeleteMissingKey(t *testing.T) {
+	n := openNode(t)
+
+	// Delete of a non-existent key is a no-op; the txn should succeed and not
+	// write anything.
+	resp, err := n.Txn(ctx(t), t4.TxnRequest{
+		Success: []t4.TxnOp{
+			{Type: t4.TxnDelete, Key: "ghost"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Txn: %v", err)
+	}
+	if !resp.Succeeded {
+		t.Error("want Succeeded=true")
+	}
+	if resp.Revision != 0 {
+		// No write should have occurred; revision stays at initial 0.
+		t.Errorf("Revision: want 0 (no-op) got %d", resp.Revision)
+	}
+}
+
+func TestTxnDeleteAndDeletedKeys(t *testing.T) {
+	n := openNode(t)
+
+	_, _ = n.Put(ctx(t), "x", []byte("val"), 0)
+
+	resp, err := n.Txn(ctx(t), t4.TxnRequest{
+		Success: []t4.TxnOp{
+			{Type: t4.TxnDelete, Key: "x"},
+			{Type: t4.TxnDelete, Key: "y"}, // does not exist
+		},
+	})
+	if err != nil {
+		t.Fatalf("Txn: %v", err)
+	}
+	if _, ok := resp.DeletedKeys["x"]; !ok {
+		t.Error("DeletedKeys: want x present")
+	}
+	if _, ok := resp.DeletedKeys["y"]; ok {
+		t.Error("DeletedKeys: want y absent (never existed)")
+	}
+
+	// x must be gone, y was never there.
+	if kv, _ := n.Get("x"); kv != nil {
+		t.Error("x should be deleted")
+	}
+}
+
+func TestTxnSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	store := object.NewMem()
+	cfg := t4.Config{DataDir: dir, ObjectStore: store}
+
+	n, err := t4.Open(cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	resp, err := n.Txn(ctx(t), t4.TxnRequest{
+		Success: []t4.TxnOp{
+			{Type: t4.TxnPut, Key: "p", Value: []byte("alpha")},
+			{Type: t4.TxnPut, Key: "q", Value: []byte("beta")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Txn: %v", err)
+	}
+	txnRev := resp.Revision
+	n.Close()
+
+	// Reopen and verify both keys survived at the same revision.
+	n2, err := t4.Open(cfg)
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	defer n2.Close()
+
+	for key, want := range map[string]string{"p": "alpha", "q": "beta"} {
+		kv, err := n2.Get(key)
+		if err != nil || kv == nil {
+			t.Fatalf("Get(%q) after restart: err=%v kv=%v", key, err, kv)
+		}
+		if string(kv.Value) != want {
+			t.Errorf("Get(%q) value: want %q got %q", key, want, kv.Value)
+		}
+		if kv.Revision != txnRev {
+			t.Errorf("Get(%q) revision: want %d got %d", key, txnRev, kv.Revision)
+		}
+	}
+}
+
+func TestTxnWatchEvents(t *testing.T) {
+n := openNode(t)
+c := ctx(t)
+
+ch, err := n.Watch(c, "", 0) // watch all keys
+if err != nil {
+t.Fatal(err)
+}
+
+// Execute the txn after the watcher is registered.
+resp, err := n.Txn(c, t4.TxnRequest{
+Success: []t4.TxnOp{
+{Type: t4.TxnPut, Key: "x", Value: []byte("1")},
+{Type: t4.TxnPut, Key: "y", Value: []byte("2")},
+},
+})
+if err != nil {
+t.Fatalf("Txn: %v", err)
+}
+txnRev := resp.Revision
+
+// Collect exactly 2 events (one per key).
+got := map[string]int64{}
+for i := 0; i < 2; i++ {
+select {
+case ev := <-ch:
+if ev.Type != t4.EventPut {
+t.Errorf("event %d: want EventPut, got %v", i, ev.Type)
+}
+got[ev.KV.Key] = ev.KV.Revision
+case <-c.Done():
+t.Fatalf("timeout waiting for txn watch event %d", i)
+}
+}
+for _, key := range []string{"x", "y"} {
+if rev, ok := got[key]; !ok {
+t.Errorf("missing Watch event for key %q", key)
+} else if rev != txnRev {
+t.Errorf("key %q: Watch event revision %d, want %d", key, rev, txnRev)
+}
+}
+}
+
+func TestTxnCompactSubKeys(t *testing.T) {
+n := openNode(t)
+c := ctx(t)
+
+// Write a single-key entry at rev 1, then a 2-key txn at rev 2.
+_, _ = n.Put(c, "before", []byte("v"), 0)
+txnResp, err := n.Txn(c, t4.TxnRequest{
+Success: []t4.TxnOp{
+{Type: t4.TxnPut, Key: "p", Value: []byte("1")},
+{Type: t4.TxnPut, Key: "q", Value: []byte("2")},
+},
+})
+if err != nil {
+t.Fatalf("Txn: %v", err)
+}
+
+// Compact up to and including the txn revision.
+if err := n.Compact(c, txnResp.Revision); err != nil {
+t.Fatalf("Compact: %v", err)
+}
+
+// Keys written in the txn must still be readable after compaction.
+for key, want := range map[string]string{"p": "1", "q": "2"} {
+kv, err := n.Get(key)
+if err != nil || kv == nil {
+t.Fatalf("Get(%q) after compact: err=%v kv=%v", key, err, kv)
+}
+if string(kv.Value) != want {
+t.Errorf("Get(%q): want %q got %q", key, want, kv.Value)
+}
+}
+}
+
+func TestTxnConcurrentCAS(t *testing.T) {
+n := openNode(t)
+
+seedRev, err := n.Put(context.Background(), "counter", []byte("0"), 0)
+if err != nil {
+t.Fatalf("Put: %v", err)
+}
+
+const workers = 20
+successes := make([]bool, workers)
+var wg sync.WaitGroup
+for i := range workers {
+wg.Add(1)
+go func(i int) {
+defer wg.Done()
+resp, err := n.Txn(context.Background(), t4.TxnRequest{
+Conditions: []t4.TxnCondition{
+{Key: "counter", Target: t4.TxnCondMod, Result: t4.TxnCondEqual, ModRevision: seedRev},
+},
+Success: []t4.TxnOp{
+{Type: t4.TxnPut, Key: "counter", Value: []byte(strconv.Itoa(i + 1))},
+},
+})
+if err == nil && resp.Succeeded {
+successes[i] = true
+}
+}(i)
+}
+wg.Wait()
+
+wins := 0
+for _, ok := range successes {
+if ok {
+wins++
+}
+}
+if wins != 1 {
+t.Errorf("concurrent CAS: want exactly 1 winner, got %d", wins)
+}
+}
+
+func TestTxnDuplicateKey(t *testing.T) {
+n := openNode(t)
+
+_, err := n.Txn(ctx(t), t4.TxnRequest{
+Success: []t4.TxnOp{
+{Type: t4.TxnPut, Key: "a", Value: []byte("1")},
+{Type: t4.TxnPut, Key: "b", Value: []byte("2")},
+{Type: t4.TxnPut, Key: "a", Value: []byte("3")}, // duplicate
+},
+})
+if err == nil {
+t.Error("Txn with duplicate key: want error, got nil")
+}
+
+// No write should have occurred.
+kv, _ := n.Get("a")
+if kv != nil {
+t.Errorf("key a should not exist after rejected txn, got %v", kv)
+}
 }
