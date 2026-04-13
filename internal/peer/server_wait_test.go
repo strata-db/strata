@@ -4,15 +4,13 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/t4db/t4/internal/wal"
 )
 
 func TestWaitForFollowersNoneReturnsImmediately(t *testing.T) {
 	srv := NewServer(16, nil)
 	srv.mu.Lock()
-	srv.followers["f1"] = make(chan *wal.Entry)
-	srv.followers["f2"] = make(chan *wal.Entry)
+	srv.followers["f1"] = make(chan *WalEntryMsg)
+	srv.followers["f2"] = make(chan *WalEntryMsg)
 	srv.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -26,8 +24,8 @@ func TestWaitForFollowersNoneReturnsImmediately(t *testing.T) {
 func TestWaitForFollowersQuorumNeedsOneOfTwoFollowers(t *testing.T) {
 	srv := NewServer(16, nil)
 	srv.mu.Lock()
-	srv.followers["f1"] = make(chan *wal.Entry)
-	srv.followers["f2"] = make(chan *wal.Entry)
+	srv.followers["f1"] = make(chan *WalEntryMsg)
+	srv.followers["f2"] = make(chan *WalEntryMsg)
 	srv.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -62,8 +60,8 @@ func TestWaitForFollowersQuorumNeedsOneOfTwoFollowers(t *testing.T) {
 func TestWaitForFollowersAllNeedsEveryConnectedFollower(t *testing.T) {
 	srv := NewServer(16, nil)
 	srv.mu.Lock()
-	srv.followers["f1"] = make(chan *wal.Entry)
-	srv.followers["f2"] = make(chan *wal.Entry)
+	srv.followers["f1"] = make(chan *WalEntryMsg)
+	srv.followers["f2"] = make(chan *WalEntryMsg)
 	srv.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -103,8 +101,8 @@ func TestWaitForFollowersAllNeedsEveryConnectedFollower(t *testing.T) {
 func TestWaitForFollowersAllReturnsWhenRemainingFollowersDisconnect(t *testing.T) {
 	srv := NewServer(16, nil)
 	srv.mu.Lock()
-	srv.followers["f1"] = make(chan *wal.Entry)
-	srv.followers["f2"] = make(chan *wal.Entry)
+	srv.followers["f1"] = make(chan *WalEntryMsg)
+	srv.followers["f2"] = make(chan *WalEntryMsg)
 	srv.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)

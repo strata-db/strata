@@ -85,12 +85,12 @@ func (c *Client) getConn() (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
-// Follow streams WAL entries from the leader starting at fromRev. For each
-// batch it first calls walFn to durably append the entries to the follower WAL,
-// then ACKs the highest revision in the batch to the leader, then calls applyFn
-// to update the follower's local state. fromRev advances automatically once the
-// WAL append succeeds. Batches contain all entries that arrived between
-// consecutive applyFn calls, amortising WAL fsyncs across multiple revisions.
+// Follow streams WAL entries from the leader starting at fromRev. The leader
+// may send entry messages ahead of its own local WAL fsync; followers stage
+// those entries in memory and only make them durable/visible after a matching
+// commit message arrives. On commit, the follower appends the committed batch
+// to its WAL, ACKs the highest committed revision back to the leader, then
+// applies the batch locally.
 //
 // Follow reconnects on transient errors. It returns:
 //   - ctx.Err() on context cancellation.
@@ -137,9 +137,9 @@ func (c *Client) Follow(ctx context.Context, fromRev int64, walFn func([]wal.Ent
 }
 
 // followOnce makes one streaming attempt using the shared connection.
-// walFn must durably append the batch to the follower's local WAL.
+// walFn must durably append a committed batch to the follower's local WAL.
 // applyFn updates follower local state after the ACK has been sent.
-// Returns the next fromRev (highest WAL-durable revision + 1) on any error.
+// Returns the next fromRev (highest committed revision + 1) on any error.
 func (c *Client) followOnce(ctx context.Context, fromRev int64, walFn func([]wal.Entry) error, applyFn func([]wal.Entry) error) (int64, error) {
 	conn, err := c.getConn()
 	if err != nil {
@@ -161,10 +161,8 @@ func (c *Client) followOnce(ctx context.Context, fromRev int64, walFn func([]wal
 
 	c.log.Infof("peer: connected to leader %s (fromRev=%d)", c.leaderAddr, fromRev)
 
-	// entryC buffers entries received from the stream so the main loop can
-	// drain multiple entries per batch, amortising WAL fsyncs (AppendBatch
-	// does one fsync for the whole batch rather than one per entry).
-	entryC := make(chan wal.Entry, 512)
+	// msgC buffers entry and commit messages received from the stream.
+	msgC := make(chan *WalEntryMsg, 512)
 	recvErrC := make(chan error, 1)
 
 	go func() {
@@ -179,7 +177,7 @@ func (c *Client) followOnce(ctx context.Context, fromRev int64, walFn func([]wal
 				return
 			}
 			select {
-			case entryC <- MsgToEntry(msg):
+			case msgC <- msg:
 			case <-streamCtx.Done():
 				recvErrC <- streamCtx.Err()
 				return
@@ -187,42 +185,66 @@ func (c *Client) followOnce(ctx context.Context, fromRev int64, walFn func([]wal
 		}
 	}()
 
+	var staged []wal.Entry
 	for {
-		// Block until at least one entry or an error.
-		var batch []wal.Entry
+		// Block until at least one message or an error.
+		var msg *WalEntryMsg
 		select {
-		case e := <-entryC:
-			batch = append(batch, e)
+		case msg = <-msgC:
 		case err := <-recvErrC:
 			return fromRev, err
 		}
 
-		// Drain any additional entries that are already buffered so we can
-		// process them in a single AppendBatch (one fsync for the lot).
+		// Drain any additional messages already buffered so we can process
+		// one or more commit notifications in a single pass.
+		msgs := []*WalEntryMsg{msg}
 	drain:
 		for {
 			select {
-			case e := <-entryC:
-				batch = append(batch, e)
+			case msg = <-msgC:
+				msgs = append(msgs, msg)
 			default:
 				break drain
 			}
 		}
 
-		batchStartRev := fromRev
-		if err := walFn(batch); err != nil {
-			return batchStartRev, err
-		}
-		fromRev = batch[len(batch)-1].Revision + 1
+		for _, msg := range msgs {
+			if !msg.Commit {
+				staged = append(staged, MsgToEntry(msg))
+				continue
+			}
+			if msg.CommitRevision < fromRev {
+				continue
+			}
 
-		// ACK the highest revision in the WAL-durable batch. The leader only
-		// needs the maximum ACK'd revision to advance its quorum counter, so
-		// one ACK per batch is enough regardless of how many entries it contained.
-		if err := stream.SendAck(batch[len(batch)-1].Revision); err != nil {
-			return fromRev, err
-		}
-		if err := applyFn(batch); err != nil {
-			return fromRev, err
+			cut := 0
+			for cut < len(staged) && staged[cut].Revision <= msg.CommitRevision {
+				cut++
+			}
+			if cut == 0 || staged[cut-1].Revision != msg.CommitRevision {
+				return fromRev, ErrResyncRequired
+			}
+			batch := staged[:cut]
+			batchStartRev := fromRev
+			if batch[0].Revision != batchStartRev {
+				return fromRev, ErrResyncRequired
+			}
+			for i, e := range batch {
+				if e.Revision != batchStartRev+int64(i) {
+					return fromRev, ErrResyncRequired
+				}
+			}
+			if err := walFn(batch); err != nil {
+				return batchStartRev, err
+			}
+			fromRev = batch[len(batch)-1].Revision + 1
+			if err := stream.SendAck(batch[len(batch)-1].Revision); err != nil {
+				return fromRev, err
+			}
+			if err := applyFn(batch); err != nil {
+				return fromRev, err
+			}
+			staged = staged[cut:]
 		}
 	}
 }

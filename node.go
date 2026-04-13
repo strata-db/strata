@@ -75,7 +75,7 @@ type TxnCondition struct {
 	// Exactly one of the following is used, depending on Target:
 	ModRevision    int64
 	CreateRevision int64
-	Version        int64  // number of writes to key; 0 means key does not exist
+	Version        int64 // number of writes to key; 0 means key does not exist
 	Value          []byte
 	Lease          int64
 }
@@ -107,8 +107,8 @@ type TxnRequest struct {
 
 // TxnResponse is returned by Node.Txn.
 type TxnResponse struct {
-	Succeeded   bool              // true if all Conditions were satisfied
-	Revision    int64             // revision assigned to the write, or current revision if no-op
+	Succeeded   bool                // true if all Conditions were satisfied
+	Revision    int64               // revision assigned to the write, or current revision if no-op
 	DeletedKeys map[string]struct{} // set of keys actually removed by the txn's write ops
 }
 
@@ -2185,20 +2185,11 @@ func (n *Node) commitLoop(ctx context.Context) {
 
 		var err error
 		if n.peerSrv != nil {
-			// Pipeline: run the leader WAL fsync concurrently with follower
-			// replication. Broadcast entries to followers immediately so their
-			// WAL writes overlap the leader's fsync. The leader fsync and the
-			// follower quorum ACKs are both required before signalling callers,
-			// preserving the same durability guarantee as the sequential path.
-			//
-			// Broadcasting before the leader fsync completes is safe: a client
-			// is only ACKed after both the leader fsync and the quorum ACK
-			// succeed. If the leader crashes before its fsync, the entry is
-			// not yet committed, matching standard Raft behaviour (etcd uses
-			// the same concurrent-write pattern).
-			//
-			// Ordering note: Broadcast must happen in revision order to avoid
-			// the peer server's maxSent dedup filter dropping entries.
+			// Pipeline: overlap network delivery to followers with the leader's
+			// own WAL fsync, but do not let followers make entries durable or
+			// visible until the leader has fsynced successfully. Followers stage
+			// entry messages in memory and wait for BroadcastCommit before
+			// appending/applying the batch locally.
 			walErrC := make(chan error, 1)
 			go func() { walErrC <- n.wal.AppendBatch(batchCtx, entries) }()
 
@@ -2206,18 +2197,23 @@ func (n *Node) commitLoop(ctx context.Context) {
 				n.peerSrv.Broadcast(&req.entry)
 			}
 
-			// Wait for follower ACKs according to the configured policy.
-			// Use the commit loop's own context (node lifetime), NOT batchCtx:
-			// batchCtx is cancelled after AppendBatch returns and passing it
-			// here would cause WaitForFollowers to return instantly.
-			//
-			// Availability policy: if all followers disconnect mid-wait, we
-			// proceed anyway — the entry is already durable in the leader's
-			// WAL and will be replayed by followers when they reconnect.
 			maxRev := batch[len(batch)-1].entry.Revision
-			_ = n.peerSrv.WaitForFollowers(ctx, maxRev, peer.WaitMode(n.cfg.FollowerWaitMode))
-
 			err = <-walErrC
+			if err == nil {
+				n.peerSrv.BroadcastCommit(maxRev)
+
+				// Wait for follower ACKs according to the configured policy.
+				// Use the commit loop's own context (node lifetime), NOT batchCtx:
+				// batchCtx is cancelled after AppendBatch returns and passing it
+				// here would cause WaitForFollowers to return instantly.
+				//
+				// Availability policy: if all followers disconnect mid-wait, we
+				// proceed anyway — the entry is already durable in the leader's
+				// WAL and will be replayed by followers when they reconnect.
+				if waitErr := n.peerSrv.WaitForFollowers(ctx, maxRev, peer.WaitMode(n.cfg.FollowerWaitMode)); waitErr != nil {
+					err = waitErr
+				}
+			}
 		} else {
 			err = n.wal.AppendBatch(batchCtx, entries)
 		}

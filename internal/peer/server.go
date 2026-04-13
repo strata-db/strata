@@ -37,7 +37,7 @@ const (
 type Server struct {
 	mu              sync.Mutex
 	buf             *entryBuffer
-	followers       map[string]chan *wal.Entry
+	followers       map[string]chan *WalEntryMsg
 	followerAckRevs map[string]int64 // last ACK'd revision per follower
 	maxBroadcastRev int64            // highest revision sent via Broadcast
 	forwardHandler  ForwardHandler
@@ -77,7 +77,7 @@ func NewServer(cap int, log peerLogger) *Server {
 	}
 	return &Server{
 		buf:              newEntryBuffer(cap),
-		followers:        make(map[string]chan *wal.Entry),
+		followers:        make(map[string]chan *WalEntryMsg),
 		followerAckRevs:  make(map[string]int64),
 		ackNotify:        make(chan struct{}, 1),
 		gracefulGoodbyes: make(map[string]struct{}),
@@ -124,13 +124,34 @@ func (s *Server) Broadcast(e *wal.Entry) {
 	var toKick []string
 	for id, ch := range s.followers {
 		select {
-		case ch <- e:
+		case ch <- EntryToMsg(e):
 		default:
 			// Channel full: close it so Follow returns an error and the follower
 			// reconnects from its last applied revision, re-fetching the gap
 			// from the ring buffer. Silently dropping the entry and continuing
 			// would leave the follower with a permanent hole.
 			s.log.Warnf("peer: follower %q too slow — disconnecting to force resync at rev=%d", id, e.Revision)
+			toKick = append(toKick, id)
+		}
+	}
+	for _, id := range toKick {
+		close(s.followers[id])
+		delete(s.followers, id)
+	}
+	s.mu.Unlock()
+}
+
+// BroadcastCommit tells followers that all entries up to rev are now
+// committed by the leader and may be made visible locally.
+func (s *Server) BroadcastCommit(rev int64) {
+	s.mu.Lock()
+	var toKick []string
+	msg := &WalEntryMsg{Commit: true, CommitRevision: rev}
+	for id, ch := range s.followers {
+		select {
+		case ch <- msg:
+		default:
+			s.log.Warnf("peer: follower %q too slow for commit signal — disconnecting to force resync at rev=%d", id, rev)
 			toKick = append(toKick, id)
 		}
 	}
@@ -264,7 +285,7 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 		metrics.FollowerResyncsTotal.WithLabelValues("ring_buffer_miss").Inc()
 		return ErrResyncRequired
 	}
-	ch := make(chan *wal.Entry, 512)
+	ch := make(chan *WalEntryMsg, 512)
 	s.followers[req.NodeID] = ch
 	var maxSent int64
 	if len(snapshot) > 0 {
@@ -329,21 +350,28 @@ func (s *Server) Follow(req *FollowRequest, stream WalStream_FollowServer) error
 			return err
 		}
 	}
+	if len(snapshot) > 0 {
+		if err := stream.Send(&WalEntryMsg{Commit: true, CommitRevision: snapshot[len(snapshot)-1].Revision}); err != nil {
+			return err
+		}
+	}
 
 	for {
 		select {
-		case e, ok := <-ch:
+		case msg, ok := <-ch:
 			if !ok {
 				// Channel was closed by Broadcast because the follower was too
 				// slow. Return a retriable error so the client reconnects and
 				// re-fetches the missed entries from the ring buffer.
 				return fmt.Errorf("follower stream closed: too slow, reconnect required")
 			}
-			if e.Revision <= maxSent {
+			if !msg.Commit && msg.Revision <= maxSent {
 				continue
 			}
-			maxSent = e.Revision
-			if err := stream.Send(EntryToMsg(e)); err != nil {
+			if !msg.Commit {
+				maxSent = msg.Revision
+			}
+			if err := stream.Send(msg); err != nil {
 				return err
 			}
 		case <-s.shutdownC:

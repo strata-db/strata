@@ -64,6 +64,7 @@ func TestStreamDelivery(t *testing.T) {
 	for i := int64(1); i <= n; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
+	srv.BroadcastCommit(n)
 
 	for i := int64(1); i <= n; i++ {
 		select {
@@ -116,6 +117,7 @@ func TestCatchUp(t *testing.T) {
 
 	// Broadcast a live entry and verify it arrives.
 	srv.Broadcast(makeEntry(4))
+	srv.BroadcastCommit(4)
 	select {
 	case e := <-received:
 		if e.Revision != 4 {
@@ -247,6 +249,7 @@ func TestMultipleFollowers(t *testing.T) {
 
 	srv.Broadcast(makeEntry(1))
 	srv.Broadcast(makeEntry(2))
+	srv.BroadcastCommit(2)
 
 	for i, ch := range received {
 		for rev := int64(1); rev <= 2; rev++ {
@@ -298,6 +301,7 @@ func TestNoDuplicatesOnCatchUp(t *testing.T) {
 	for i := int64(6); i <= 8; i++ {
 		srv.Broadcast(makeEntry(i))
 	}
+	srv.BroadcastCommit(8)
 
 	<-done
 
@@ -306,5 +310,43 @@ func TestNoDuplicatesOnCatchUp(t *testing.T) {
 		if revisions[i] <= revisions[i-1] {
 			t.Errorf("non-monotonic revisions at index %d: %v -> %v", i, revisions[i-1], revisions[i])
 		}
+	}
+}
+
+func TestFollowerAppliesOnlyAfterCommit(t *testing.T) {
+	srv := peer.NewServer(1000, nil)
+	addr := startServer(t, srv)
+
+	cli := peer.NewClient(addr, "follower-1", 3, nil, nil)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	applied := make(chan wal.Entry, 4)
+	go func() {
+		_ = cli.Follow(ctx, 1, noopWAL, func(entries []wal.Entry) error {
+			for _, e := range entries {
+				applied <- e
+			}
+			return nil
+		})
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	srv.Broadcast(makeEntry(1))
+
+	select {
+	case e := <-applied:
+		t.Fatalf("entry applied before commit: rev=%d", e.Revision)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	srv.BroadcastCommit(1)
+	select {
+	case e := <-applied:
+		if e.Revision != 1 {
+			t.Fatalf("applied wrong revision: got %d", e.Revision)
+		}
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for committed entry")
 	}
 }
