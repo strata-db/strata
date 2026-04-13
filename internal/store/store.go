@@ -79,6 +79,25 @@ func Open(dir string, log logger, extraOpts ...func(*pebble.Options)) (*Store, e
 	}
 }
 
+// OpenReadOnly opens an existing Pebble database in read-only mode.
+// It is intended for offline inspection tools and never creates the DB.
+func OpenReadOnly(dir string, extraOpts ...func(*pebble.Options)) (*Store, error) {
+	opts := &pebble.Options{ReadOnly: true}
+	for _, fn := range extraOpts {
+		fn(opts)
+	}
+	db, err := pebble.Open(dir, opts)
+	if err != nil {
+		return nil, fmt.Errorf("store: open read-only pebble %q: %w", dir, err)
+	}
+	s := &Store{db: db, notify: make(chan struct{}), closed: make(chan struct{})}
+	if err := s.loadMeta(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
 // isPebbleLockError reports whether err is a lock-file contention error.
 // Pebble names its lock file "LOCK", so the path always appears in the message.
 func isPebbleLockError(err error) bool {
@@ -567,6 +586,42 @@ func (s *Store) Count(prefix string) (int64, error) {
 		n++
 	}
 	return n, iter.Error()
+}
+
+// History returns change events for a single key in revision order.
+func (s *Store) History(key string) ([]Event, error) {
+	if key == "" {
+		return nil, fmt.Errorf("store: history key must not be empty")
+	}
+	events, err := s.scanLog("", 1, atomic.LoadInt64(&s.currentRev))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Event, 0, len(events))
+	for _, ev := range events {
+		if ev.KV != nil && ev.KV.Key == key {
+			out = append(out, ev)
+		}
+	}
+	return out, nil
+}
+
+// Changes returns change events for keys matching prefix in [fromRev, toRev].
+func (s *Store) Changes(prefix string, fromRev, toRev int64) ([]Event, error) {
+	if fromRev <= 0 {
+		return nil, fmt.Errorf("store: from revision must be >= 1")
+	}
+	if toRev < fromRev {
+		return nil, fmt.Errorf("store: to revision must be >= from revision")
+	}
+	currentRev := atomic.LoadInt64(&s.currentRev)
+	if currentRev == 0 || fromRev > currentRev {
+		return []Event{}, nil
+	}
+	if toRev > currentRev {
+		toRev = currentRev
+	}
+	return s.scanLog(prefix, fromRev, toRev)
 }
 
 // --- Watch ---

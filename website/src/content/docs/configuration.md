@@ -145,3 +145,57 @@ Removes the branch registry entry from the source store. The next GC run on the 
 | `--s3-prefix` | S3 prefix of the source database |
 | `--s3-endpoint` | Custom S3 endpoint (optional) |
 | `--branch-id` | Branch identifier to remove |
+
+---
+
+## CLI: `t4 inspect`
+
+Inspect a local `data-dir` in read-only mode without starting a server.
+
+### `t4 inspect meta`
+
+```bash
+t4 inspect meta --data-dir <dir>
+```
+
+Shows current revision, compact revision, and total live key count for the local Pebble database.
+
+### `t4 inspect get`
+
+```bash
+t4 inspect get --data-dir <dir> <key>
+```
+
+Shows the current value and metadata for one key.
+
+### `t4 inspect list`
+
+```bash
+t4 inspect list --data-dir <dir> [--prefix <prefix>] [--limit <n>]
+```
+
+Lists live keys and their metadata, optionally filtered by prefix.
+
+### `t4 inspect count`
+
+```bash
+t4 inspect count --data-dir <dir> [--prefix <prefix>]
+```
+
+Counts live keys, optionally filtered by prefix.
+
+### `t4 inspect history`
+
+```bash
+t4 inspect history --data-dir <dir> [--limit <n>] <key>
+```
+
+Shows the change history for one key in revision order.
+
+### `t4 inspect diff`
+
+```bash
+t4 inspect diff --data-dir <dir> --from-rev <rev> [--to-rev <rev>] [--prefix <prefix>]
+```
+
+Summarizes keys that changed in a revision range, including before/after values.

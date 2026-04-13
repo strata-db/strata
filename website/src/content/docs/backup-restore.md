@@ -86,10 +86,13 @@ t4 restore checkpoint \
   --checkpoint checkpoint/0000000001/00000000000000000050/manifest.json \
   --data-dir /var/lib/t4-pitr
 
-# 3. Start a verification node (no S3 → stays at rev 50, read-only inspection).
-t4 run --data-dir /var/lib/t4-pitr --listen 0.0.0.0:3380
+# 3. Inspect the restored data offline, without starting a server.
+t4 inspect meta --data-dir /var/lib/t4-pitr
+t4 inspect list --data-dir /var/lib/t4-pitr --prefix /
+t4 inspect history --data-dir /var/lib/t4-pitr /your/key
 
-# 4. Inspect data, verify correctness.
+# 4. Optionally start a verification node if you want to use etcd clients too.
+t4 run --data-dir /var/lib/t4-pitr --listen 0.0.0.0:3380
 etcdctl --endpoints=localhost:3380 get --prefix /
 
 # 5. When satisfied, promote to a new production prefix.
@@ -211,6 +214,10 @@ After restoring, verify that data is intact before promoting the node:
 ```bash
 # Check the revision at which the node is running.
 curl -s http://localhost:9090/metrics | grep t4_revision
+
+# Or inspect the restored local data directory directly.
+t4 inspect meta --data-dir /var/lib/t4-restored
+t4 inspect count --data-dir /var/lib/t4-restored --prefix /
 
 # Spot-check key data.
 etcdctl --endpoints=localhost:3379 get --prefix /your/prefix --limit 100

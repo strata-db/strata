@@ -23,5 +23,6 @@ func rootCmd() *cobra.Command {
 	root.AddCommand(restoreCmd())
 	root.AddCommand(gcCmd())
 	root.AddCommand(statusCmd())
+	root.AddCommand(inspectCmd())
 	return root
 }

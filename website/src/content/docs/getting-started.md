@@ -61,6 +61,18 @@ etcdctl --endpoints=localhost:3379 watch /config/ --prefix
 
 The etcd Go client, Python `etcd3`, Java client, and `etcdctl` all work unchanged.
 
+### Inspect local data offline
+
+Use `t4 inspect` when you want to explore a local data directory without starting the server:
+
+```bash
+t4 inspect meta --data-dir /var/lib/t4
+t4 inspect list --data-dir /var/lib/t4 --prefix /config/
+t4 inspect get --data-dir /var/lib/t4 /config/timeout
+t4 inspect history --data-dir /var/lib/t4 /config/timeout
+t4 inspect diff --data-dir /var/lib/t4 --from-rev 10 --to-rev 20 --prefix /config/
+```
+
 ### Multi-node cluster
 
 All nodes run the same command — no membership config, no initial cluster flag. The first node to write the S3 lock becomes leader; the rest become followers.

@@ -91,6 +91,21 @@ etcdctl --endpoints=localhost:3379 put /hello world
 etcdctl --endpoints=localhost:3379 get /hello
 ```
 
+For offline inspection of a local data directory, use `t4 inspect`:
+
+```bash
+# Show local metadata without starting a server.
+t4 inspect meta --data-dir /var/lib/t4
+
+# Explore current keys.
+t4 inspect list --data-dir /var/lib/t4 --prefix /config/
+t4 inspect get --data-dir /var/lib/t4 /config/timeout
+
+# Explore revision history and changes over time.
+t4 inspect history --data-dir /var/lib/t4 /config/timeout
+t4 inspect diff --data-dir /var/lib/t4 --from-rev 100 --to-rev 120 --prefix /config/
+```
+
 Multi-node and production setup: see [Operations](https://t4db.github.io/t4/operations/).
 
 ---
