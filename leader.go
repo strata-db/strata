@@ -22,7 +22,7 @@ import (
 // Re-opens the WAL with an S3 uploader, starts the peer gRPC server,
 // and launches the watchLoop. Must NOT be called with n.mu held.
 func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *election.LockRecord) error {
-	n.wal.Close()
+	_ = n.wal.Close()
 	walDir := filepath.Join(n.cfg.DataDir, "wal")
 
 	// Upload any local WAL segments that were not yet in S3 before taking on
@@ -73,7 +73,7 @@ func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *ele
 	peerSrv := peer.NewServer(n.cfg.PeerBufferSize, n.log)
 	lis, err := net.Listen("tcp", n.cfg.PeerListenAddr)
 	if err != nil {
-		w2.Close()
+		_ = w2.Close()
 		return fmt.Errorf("t4: peer listen %s: %w", n.cfg.PeerListenAddr, err)
 	}
 	serverOpts := []grpc.ServerOption{grpc.ForceServerCodec(peer.Codec{})}
@@ -371,7 +371,7 @@ func (n *Node) commitLoop(ctx context.Context) {
 		// Wait for any writer currently in the critical section (between closed
 		// check and queue send) to finish, then perform a final drain pass.
 		n.mu.Lock()
-		n.mu.Unlock()
+		n.mu.Unlock() //nolint:staticcheck // SA2001: intentional memory barrier, not a mistake
 		for {
 			select {
 			case req := <-n.writeC:

@@ -57,11 +57,11 @@ func replayPinned(ctx context.Context, db *istore.Store, rp *RestorePoint, after
 		}
 		sr, err := wal.NewSegmentReader(rc)
 		if err != nil {
-			rc.Close()
+			_ = rc.Close()
 			return fmt.Errorf("replayPinned segment %q: %w", seg.Key, err)
 		}
 		entries, readErr := sr.ReadAll()
-		rc.Close()
+		_ = rc.Close()
 		if readErr != nil {
 			log.Warnf("t4: partial pinned segment %q: %v", seg.Key, readErr)
 		}
@@ -109,14 +109,14 @@ func (n *Node) restoreDBIfBehindCheckpoint(ctx context.Context) (bool, error) {
 	// ── Phase 1: restore checkpoint SSTs to a temp dir (no lock held) ───────
 	var newTerm uint64
 	for attempt := 0; ; attempt++ {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t, _, rerr := n.cp.Restore(ctx, n.cfg.ObjectStore, manifest.CheckpointKey, tmpDir)
 		if rerr == nil {
 			newTerm = t
 			break
 		}
 		if !errors.Is(rerr, object.ErrNotFound) || attempt >= 4 {
-			os.RemoveAll(tmpDir)
+			_ = os.RemoveAll(tmpDir)
 			return false, fmt.Errorf("restore checkpoint: %w", rerr)
 		}
 		// Checkpoint was GC'd between manifest read and restore — re-read
@@ -126,11 +126,11 @@ func (n *Node) restoreDBIfBehindCheckpoint(ctx context.Context) (bool, error) {
 		time.Sleep(500 * time.Millisecond)
 		manifest, err = n.cp.ReadManifest(ctx, n.cfg.ObjectStore)
 		if err != nil {
-			os.RemoveAll(tmpDir)
+			_ = os.RemoveAll(tmpDir)
 			return false, fmt.Errorf("re-read manifest: %w", err)
 		}
 		if manifest == nil {
-			os.RemoveAll(tmpDir)
+			_ = os.RemoveAll(tmpDir)
 			return false, fmt.Errorf("manifest disappeared during restore")
 		}
 	}
@@ -160,19 +160,19 @@ func (n *Node) restoreDBIfBehindCheckpoint(ctx context.Context) (bool, error) {
 	if rerr := oldDB.Close(); rerr != nil {
 		n.readMu.Unlock()
 		n.fenceMu.Unlock()
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		return false, fmt.Errorf("close old pebble before restore swap: %w", rerr)
 	}
 	if rerr := os.RemoveAll(pebbleDir); rerr != nil {
 		n.readMu.Unlock()
 		n.fenceMu.Unlock()
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		return false, fmt.Errorf("remove old pebble dir: %w", rerr)
 	}
 	if rerr := os.Rename(tmpDir, pebbleDir); rerr != nil {
 		n.readMu.Unlock()
 		n.fenceMu.Unlock()
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		return false, fmt.Errorf("rename resync dir: %w", rerr)
 	}
 	newDB, rerr := istore.Open(pebbleDir, n.log)
@@ -218,11 +218,11 @@ func replayRemote(ctx context.Context, db *istore.Store, obj object.Store, after
 		}
 		sr, err := wal.NewSegmentReader(rc)
 		if err != nil {
-			rc.Close()
+			_ = rc.Close()
 			return fmt.Errorf("replayRemote segment %q: %w", key, err)
 		}
 		entries, readErr := sr.ReadAll()
-		rc.Close()
+		_ = rc.Close()
 		if readErr != nil {
 			log.Warnf("t4: partial remote segment %q: %v", key, readErr)
 		}

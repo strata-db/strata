@@ -298,7 +298,7 @@ func (n *Node) resyncFromCheckpoint(bgCtx context.Context) error {
 	// Append calls can race with this replacement.
 	walDir := filepath.Join(n.cfg.DataDir, "wal")
 	newRev := n.db.Load().CurrentRevision()
-	n.wal.Close()
+	_ = n.wal.Close()
 	if rerr := os.RemoveAll(walDir); rerr != nil {
 		n.log.Warnf("t4: remove old wal dir during resync: %v", rerr)
 	}
