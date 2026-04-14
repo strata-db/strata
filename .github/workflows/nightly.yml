@@ -27,6 +27,6 @@ jobs:
 
       - name: TestLongRunningConsistency (30m)
         run: |
-          go test -run TestLongRunningConsistency -v -timeout 35m -count=1 .
+          go test -run TestLongRunningConsistency -v -timeout 35m -count=1 ./tests/integration
         env:
           TEST_DURATION: 30m
