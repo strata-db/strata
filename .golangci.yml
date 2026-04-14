@@ -1,0 +1,15 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  settings:
+    errcheck:
+      # Ignore error returns from fmt.Fprint* (writing to stdout/stderr can't usefully fail).
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintln
+        - fmt.Fprintf
+

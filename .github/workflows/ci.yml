@@ -7,9 +7,13 @@ on:
   pull_request:
     branches: ["**"]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: Test (${{ matrix.os }})
+  test-unit:
+    name: Test Unit (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -27,14 +31,18 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Vet
-        run: go vet ./...
+      - name: Test (unit)
+        run: |
+          go test -short -timeout 360s -count=1 \
+            . \
+            ./cmd/t4 \
+            ./etcd \
+            ./etcd/auth \
+            ./internal/... \
+            ./pkg/object
 
-      - name: Test (race)
-        run: go test -race -timeout 360s -count=1 ./...
-
-  benchmark:
-    name: Benchmark
+  test-integration-linux:
+    name: Test Integration (Linux)
     runs-on: ubuntu-latest
 
     steps:
@@ -48,23 +56,23 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Benchmark (root package)
-        run: |
-          go test -bench=. -benchtime=5s -benchmem -run='^$' . \
-            | tee bench-root.txt
-          cat bench-root.txt
+      - name: Test (integration)
+        run: go test -short -timeout 360s -count=1 ./tests/integration
 
-      - name: Benchmark (etcd adapter)
-        run: |
-          go test -bench=. -benchtime=5s -benchmem -run='^$' ./etcd/ \
-            | tee bench-etcd.txt
-          cat bench-etcd.txt
+  test-race-linux:
+    name: Test Race (Linux)
+    runs-on: ubuntu-latest
 
-      - name: Upload benchmark results
-        # Only run on pushes to master to avoid noise on every PR commit.
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/upload-artifact@v4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
         with:
-          name: benchmarks-${{ github.sha }}
-          path: bench-*.txt
-          retention-days: 90
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Test (race)
+        run: go test -race -timeout 360s -count=1 ./...

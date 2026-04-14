@@ -1,4 +1,4 @@
-package t4_test
+package integration_test
 
 // TestLongRunningConsistency is a chaos-style stress test that exercises the
 // full lifecycle of a t4 cluster:
