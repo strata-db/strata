@@ -168,7 +168,7 @@ func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock, grac
 			// Back off from election, but do not keep retrying a stale endpoint.
 			// If the lock advertises a leader address, switch followLoop to it.
 			if existing.LeaderAddr != "" {
-				return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log), false
+				return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log, n.cfg.TracerProvider), false
 			}
 			return nil, false
 		}
@@ -183,7 +183,7 @@ func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock, grac
 		n.log.Infof("t4: takeover: node is behind leader committed rev (ours=%d, leader=%d) — following current leader to catch up",
 			n.db.Load().CurrentRevision(), existing.CommittedRev)
 		if existing.LeaderAddr != "" {
-			return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log), false
+			return peer.NewClient(existing.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log, n.cfg.TracerProvider), false
 		}
 		return nil, false
 	}
@@ -237,7 +237,7 @@ func (n *Node) attemptPromotion(bgCtx context.Context, lock *election.Lock, grac
 
 	if rec != nil && rec.LeaderAddr != "" {
 		n.log.Infof("t4: lost election to %s (term=%d) — following", rec.NodeID, rec.Term)
-		return peer.NewClient(rec.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log), false
+		return peer.NewClient(rec.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log, n.cfg.TracerProvider), false
 	}
 	return nil, false
 }

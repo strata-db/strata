@@ -226,6 +226,7 @@ func runCmd() *cobra.Command {
 					Timeout:             grpcKeepaliveTimeout,
 				}),
 			)...)
+			grpcOpts = append(grpcOpts, t4etcd.TracingOptions(nil)...)
 
 			lis, err := net.Listen("tcp", listenAddr)
 			if err != nil {

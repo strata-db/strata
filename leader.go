@@ -9,6 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 
 	"github.com/t4db/t4/internal/election"
@@ -79,6 +82,12 @@ func (n *Node) becomeLeader(bgCtx context.Context, lock *election.Lock, rec *ele
 	serverOpts := []grpc.ServerOption{grpc.ForceServerCodec(peer.Codec{})}
 	if n.cfg.PeerServerTLS != nil {
 		serverOpts = append(serverOpts, grpc.Creds(n.cfg.PeerServerTLS))
+	}
+	tp := n.cfg.TracerProvider
+	if tp != nil {
+		serverOpts = append(serverOpts, grpc.StatsHandler(otelgrpc.NewServerHandler(
+			otelgrpc.WithTracerProvider(tp),
+		)))
 	}
 	grpcSrv := grpc.NewServer(serverOpts...)
 	peer.RegisterWalStreamServer(grpcSrv, peerSrv)
@@ -418,28 +427,53 @@ func (n *Node) commitLoop(ctx context.Context) {
 		}
 
 		// Write all entries to WAL with one fsync.
+		// Fold WAL child-span start into this loop to avoid a separate pass.
 		entries := make([]*wal.Entry, len(batch))
 		for i, req := range batch {
 			entries[i] = &req.entry
+			if req.span != nil {
+				_, req.walSpan = n.tracer.Start(
+					trace.ContextWithSpan(context.Background(), req.span),
+					"t4.wal.append",
+				)
+			}
 		}
 
-		var err error
+		var (
+			err           error
+			walLatency    time.Duration
+			quorumLatency time.Duration
+		)
 		if n.peerSrv != nil {
 			// Pipeline: overlap network delivery to followers with the leader's
 			// own WAL fsync, but do not let followers make entries durable or
 			// visible until the leader has fsynced successfully. Followers stage
 			// entry messages in memory and wait for BroadcastCommit before
 			// appending/applying the batch locally.
+			walStart := time.Now()
 			walErrC := make(chan error, 1)
 			go func() { walErrC <- n.wal.AppendBatch(batchCtx, entries) }()
 
+			// Fold quorum child-span start into the existing broadcast loop.
 			for _, req := range batch {
 				n.peerSrv.Broadcast(&req.entry)
+				if req.span != nil {
+					_, req.quorumSpan = n.tracer.Start(
+						trace.ContextWithSpan(context.Background(), req.span),
+						"t4.peer.wait_quorum",
+					)
+				}
 			}
 
 			startRev := batch[0].entry.Revision
 			maxRev := batch[len(batch)-1].entry.Revision
 			err = <-walErrC
+			walLatency = time.Since(walStart)
+			for _, req := range batch {
+				if req.walSpan != nil {
+					endSpanWithErr(req.walSpan, err)
+				}
+			}
 			if err == nil {
 				n.peerSrv.BroadcastCommit(startRev, maxRev)
 
@@ -451,12 +485,26 @@ func (n *Node) commitLoop(ctx context.Context) {
 				// Availability policy: if all followers disconnect mid-wait, we
 				// proceed anyway — the entry is already durable in the leader's
 				// WAL and will be replayed by followers when they reconnect.
+				quorumStart := time.Now()
 				if waitErr := n.peerSrv.WaitForFollowers(ctx, maxRev, peer.WaitMode(n.cfg.FollowerWaitMode)); waitErr != nil {
 					err = waitErr
 				}
+				quorumLatency = time.Since(quorumStart)
+			}
+			for _, req := range batch {
+				if req.quorumSpan != nil {
+					endSpanWithErr(req.quorumSpan, err)
+				}
 			}
 		} else {
+			walStart := time.Now()
 			err = n.wal.AppendBatch(batchCtx, entries)
+			walLatency = time.Since(walStart)
+			for _, req := range batch {
+				if req.walSpan != nil {
+					endSpanWithErr(req.walSpan, err)
+				}
+			}
 		}
 		batchCancel() // release watcher goroutines
 
@@ -472,6 +520,13 @@ func (n *Node) commitLoop(ctx context.Context) {
 		// Clear optimistic state before waking callers so a failed batch cannot
 		// leak stale pending revisions into a racing follow-up write.
 		n.clearPendingBatch(batch)
+
+		// Stamp timing onto each request so await() can attach them as span attributes.
+		for _, req := range batch {
+			req.walLatency = walLatency
+			req.quorumLatency = quorumLatency
+			req.batchSize = len(batch)
+		}
 
 		// Signal all callers.
 		for _, req := range batch {
@@ -668,4 +723,13 @@ func (n *Node) maybeCheckpoint(ctx context.Context) {
 			n.log.Infof("t4: sst gc: deleted %d orphan sst(s)", sstDeleted)
 		}
 	}
+}
+
+// endSpanWithErr ends s, recording err when non-nil.
+func endSpanWithErr(s trace.Span, err error) {
+	if err != nil {
+		s.RecordError(err)
+		s.SetStatus(otelcodes.Error, err.Error())
+	}
+	s.End()
 }
