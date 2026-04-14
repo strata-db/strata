@@ -1,0 +1,46 @@
+name: Benchmarks
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Benchmark
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Benchmark (root package)
+        run: |
+          go test -bench=. -benchtime=5s -benchmem -run='^$' . \
+            | tee bench-root.txt
+          cat bench-root.txt
+
+      - name: Benchmark (etcd adapter)
+        run: |
+          go test -bench=. -benchtime=5s -benchmem -run='^$' ./etcd/ \
+            | tee bench-etcd.txt
+          cat bench-etcd.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-${{ github.sha }}
+          path: bench-*.txt
+          retention-days: 90

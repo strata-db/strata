@@ -1,4 +1,4 @@
-package t4_test
+package integration_test
 
 import (
 	"bytes"
