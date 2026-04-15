@@ -28,6 +28,49 @@ function rehypePrependBase(base) {
 // In local dev both are unset and the defaults below are used.
 const site = process.env.SITE ?? 'https://t4db.github.io';
 const base = process.env.BASE_PATH ?? '/t4';
+const googleAnalyticsId = process.env.PUBLIC_GA_MEASUREMENT_ID;
+
+const head = [
+	{
+		tag: 'meta',
+		attrs: {
+			property: 'og:description',
+			content: 'An embeddable, S3-durable key-value store for Go with etcd v3 compatibility.',
+		},
+	},
+];
+
+if (googleAnalyticsId) {
+	head.push(
+		{
+			tag: 'script',
+			content: [
+				'window.dataLayer = window.dataLayer || [];',
+				'function gtag(){dataLayer.push(arguments);}',
+				"gtag('consent', 'default', {",
+				"  ad_storage: 'denied',",
+				"  ad_user_data: 'denied',",
+				"  ad_personalization: 'denied',",
+				"  analytics_storage: 'denied',",
+				'});',
+			].join('\n'),
+		},
+		{
+			tag: 'script',
+			attrs: {
+				async: true,
+				src: `https://www.googletagmanager.com/gtag/js?id=${googleAnalyticsId}`,
+			},
+		},
+		{
+			tag: 'script',
+			content: [
+				"gtag('js', new Date());",
+				`gtag('config', '${googleAnalyticsId}');`,
+			].join('\n'),
+		}
+	);
+}
 
 // https://astro.build/config
 export default defineConfig({
@@ -82,15 +125,7 @@ export default defineConfig({
 				{ label: 'Troubleshooting', slug: 'troubleshooting' },
 				{ label: 'FAQ', slug: 'faq' },
 			],
-			head: [
-				{
-					tag: 'meta',
-					attrs: {
-						property: 'og:description',
-						content: 'An embeddable, S3-durable key-value store for Go with etcd v3 compatibility.',
-					},
-				},
-			],
+			head,
 		}),
 	],
 });
