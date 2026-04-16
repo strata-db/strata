@@ -17,6 +17,8 @@ jobs:
       tag_name: ${{ steps.tag.outputs.tag_name }}
       image_tag: ${{ steps.image_tag.outputs.image_tag }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Resolve tag
         id: tag
         run: |
@@ -94,9 +96,9 @@ jobs:
           - goos: darwin
             goarch: arm64
             archive: tar.gz
-#          - goos: windows
-#            goarch: amd64
-#            archive: zip
+    #          - goos: windows
+    #            goarch: amd64
+    #            archive: zip
     steps:
       - uses: actions/checkout@v4
 
