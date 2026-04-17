@@ -2,9 +2,9 @@
 /**
  * Starlight Header override.
  *
- * Identical to the built-in Header component with one addition: a "Docs"
- * text link that points to /getting-started/, placed in the right-group
- * alongside the social icons and theme selector.
+ * Identical to the built-in Header component with extra text links for the
+ * playground and docs, placed in the right-group alongside the social icons
+ * and theme selector.
  *
  * We import from the virtual:starlight/components/* namespace for all
  * sub-components (Search, SiteTitle, etc.) — only the Header itself is
@@ -22,6 +22,7 @@ const shouldRenderSearch =
 	config.pagefind || config.components.Search !== '@astrojs/starlight/components/Search.astro';
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const playgroundHref = base + '/playground/';
 const docsHref = base + '/getting-started/';
 ---
 
@@ -33,7 +34,8 @@ const docsHref = base + '/getting-started/';
 		{shouldRenderSearch && <Search />}
 	</div>
 	<div class="sl-hidden md:sl-flex print:hidden right-group">
-		<a href={docsHref} class="docs-link">Docs</a>
+		<a href={playgroundHref} class="nav-link">Playground</a>
+		<a href={docsHref} class="nav-link docs-link">Docs</a>
 		<div class="sl-flex social-icons">
 			<SocialIcons />
 		</div>
@@ -70,14 +72,16 @@ const docsHref = base + '/getting-started/';
 			border-inline-end: 1px solid var(--sl-color-gray-5);
 		}
 
-		.docs-link {
+		.nav-link {
 			font-size: var(--sl-text-sm);
 			color: var(--sl-color-gray-2);
 			text-decoration: none;
+		}
+		.docs-link {
 			padding-inline-end: 1rem;
 			border-inline-end: 1px solid var(--sl-color-gray-5);
 		}
-		.docs-link:hover {
+		.nav-link:hover {
 			color: var(--sl-color-white);
 		}
 

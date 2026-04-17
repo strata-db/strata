@@ -1,0 +1,351 @@
+---
+const assetBase = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/playground`;
+---
+
+<div class="t4-playground" data-t4-playground data-asset-base={assetBase}>
+	<div class="playground-status" data-status>Loading T4 WASM...</div>
+
+	<section class="playground-terminal" aria-label="T4 playground terminal">
+		<pre data-terminal>booting t4 wasm...</pre>
+		<form data-command-form class="playground-prompt">
+			<span aria-hidden="true">t4&gt;</span>
+			<input
+				data-command
+				autocomplete="off"
+				spellcheck="false"
+				aria-label="T4 command"
+				placeholder="type help"
+			/>
+		</form>
+	</section>
+
+	<section class="playground-playback" aria-label="Revision playback">
+		<div class="playback-toolbar">
+			<span data-frame-label>rev 0 - live</span>
+		</div>
+		<input data-playback type="range" min="0" max="0" value="0" step="1" aria-label="Revision playback position" />
+	</section>
+</div>
+
+<script>
+	const root = document.querySelector('[data-t4-playground]');
+	const state = {
+		api: null,
+		watchTimer: null,
+		liveTimer: null,
+		history: [],
+		frame: 0,
+		live: true,
+		log: ['booting t4 wasm...'],
+		commandHistory: [],
+		commandIndex: 0,
+	};
+
+	const els = {
+		status: root.querySelector('[data-status]'),
+		terminal: root.querySelector('[data-terminal]'),
+		form: root.querySelector('[data-command-form]'),
+		command: root.querySelector('[data-command]'),
+		playback: root.querySelector('[data-playback]'),
+		frameLabel: root.querySelector('[data-frame-label]'),
+	};
+
+	const helpText = [
+		'commands:',
+		'  put <key> <value>      write a key',
+		'  get <key>              read a key',
+		'  list [prefix]          list keys',
+		'  delete <key>           delete a key',
+		'  watch [prefix]         watch key changes',
+		'  fs                     show Pebble memory filesystem',
+		'  wal                    show demo WAL entries',
+		'  events                 show watch events',
+		'  flush                  flush Pebble/WAL state',
+		'  rev                    show current revision',
+		'  sample                 run a tiny demo',
+		'  reset                  clear the tab-local node',
+		'  live                   jump playback to the latest revision',
+		'  help                   show this help',
+	].join('\n');
+
+	function setText(node, value) {
+		node.textContent = value;
+	}
+
+	function pretty(value) {
+		return JSON.stringify(value, null, 2);
+	}
+
+	function print(line = '') {
+		state.log.push(line);
+		if (state.log.length > 200) state.log.shift();
+		renderLog(state.log);
+	}
+
+	function renderLog(lines) {
+		setText(els.terminal, lines.join('\n'));
+		els.terminal.scrollTop = els.terminal.scrollHeight;
+	}
+
+	function loadScript(src) {
+		return new Promise((resolve, reject) => {
+			const script = document.createElement('script');
+			script.src = src;
+			script.onload = resolve;
+			script.onerror = () => reject(new Error(`failed to load ${src}`));
+			document.head.append(script);
+		});
+	}
+
+	async function waitForAPI() {
+		for (let i = 0; i < 100; i += 1) {
+			if (globalThis.t4play) return globalThis.t4play;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		throw new Error('T4 WASM API did not initialize');
+	}
+
+	async function init() {
+		const assetBase = root.dataset.assetBase;
+		await loadScript(`${assetBase}/wasm_exec.js`);
+		const go = new globalThis.Go();
+		const wasmURL = `${assetBase}/t4play.wasm`;
+		const result = await WebAssembly.instantiateStreaming(fetch(wasmURL), go.importObject);
+		go.run(result.instance);
+		state.api = await waitForAPI();
+		state.log = [
+			'T4 is running in this tab.',
+			'Try: put /demo/message hello',
+			'Type help for commands.',
+		];
+		setText(els.status, 'T4 is running in this tab.');
+		captureFrame('started', { ok: true });
+		state.liveTimer = setInterval(() => refreshLive('background update'), 1000);
+		els.command.focus();
+	}
+
+	function ensureAPI() {
+		if (!state.api) throw new Error('T4 is still loading');
+		return state.api;
+	}
+
+	function parseCommand(input) {
+		const out = [];
+		const pattern = /"([^"]*)"|'([^']*)'|(\S+)/g;
+		for (const match of input.matchAll(pattern)) {
+			out.push(match[1] ?? match[2] ?? match[3]);
+		}
+		return out;
+	}
+
+	function formatKV(kv) {
+		return `${kv.key} = ${kv.value}  rev=${kv.revision} create=${kv.createRevision}`;
+	}
+
+	function formatList(result) {
+		if (!result.ok) return result.error;
+		if (!result.items.length) return 'no keys';
+		return result.items.map(formatKV).join('\n');
+	}
+
+	function formatFS(result) {
+		if (!result.ok) return result.error;
+		if (!result.files.length) return 'no files';
+		return result.files.map((f) => `${f.isDir ? 'dir ' : 'file'} ${f.path} ${f.size}B`).join('\n');
+	}
+
+	function formatResult(command, result) {
+		if (!result || !result.ok) return result?.error ?? 'command failed';
+		if (command === 'put') return `ok rev=${result.revision}`;
+		if (command === 'delete') return `deleted rev=${result.revision}`;
+		if (command === 'get') return result.found ? formatKV(result.kv) : 'not found';
+		if (command === 'list') return formatList(result);
+		if (command === 'watch') return `watching ${result.prefix || '/'}`;
+		if (command === 'flush') return `flushed rev=${result.revision}`;
+		if (command === 'fs') return formatFS(result);
+		if (command === 'wal') return result.entries.length ? pretty(result.entries) : 'no WAL entries';
+		if (command === 'events') return result.events.length ? pretty(result.events) : 'no events';
+		if (command === 'rev') return `rev=${result.revision}`;
+		if (command === 'reset') return 'reset';
+		return pretty(result);
+	}
+
+	function renderFrame(frame) {
+		if (!frame) return;
+		renderLog(frame.log);
+		els.playback.max = String(Math.max(0, state.history.length - 1));
+		els.playback.value = String(state.frame);
+		setText(
+			els.frameLabel,
+			`rev ${frame.revision} - ${state.frame + 1} / ${state.history.length}${state.live ? ' - live' : ''}`
+		);
+	}
+
+	function buildFrame(label, result) {
+		const api = ensureAPI();
+		const revision = api.revision();
+		return {
+			label,
+			result,
+			revision: revision.ok ? revision.revision : 0,
+			log: [...state.log],
+		};
+	}
+
+	function captureFrame(label, result) {
+		const frame = buildFrame(label, result);
+		const last = state.history[state.history.length - 1];
+		if (last && last.revision === frame.revision) {
+			state.history[state.history.length - 1] = frame;
+			if (state.live || state.frame === state.history.length - 1) {
+				state.frame = state.history.length - 1;
+				state.live = true;
+				renderFrame(frame);
+			}
+			return;
+		}
+		state.history.push(frame);
+		state.frame = state.history.length - 1;
+		state.live = true;
+		renderFrame(frame);
+	}
+
+	function refreshLive(label = 'refresh') {
+		if (!state.live) return;
+		captureFrame(label, { ok: true });
+	}
+
+	function showFrame(index) {
+		state.frame = Math.min(Math.max(index, 0), state.history.length - 1);
+		state.live = state.frame === state.history.length - 1;
+		renderFrame(state.history[state.frame]);
+	}
+
+	function startWatchRefresh() {
+		clearInterval(state.watchTimer);
+		state.watchTimer = setInterval(() => {
+			if (!state.live) return;
+			const events = ensureAPI().events();
+			if (events.ok && events.events.length) {
+				const latest = events.events[events.events.length - 1];
+				const line = `watch ${latest.type} ${latest.kv.key} rev=${latest.kv.revision}`;
+				if (state.log[state.log.length - 1] !== line) print(line);
+			}
+			refreshLive('watch update');
+		}, 500);
+	}
+
+	function runSample(api) {
+		let result = api.watch('/demo/');
+		print(formatResult('watch', result));
+		captureFrame('watch /demo/', result);
+		result = api.put('/demo/message', 'hello from wasm');
+		print(formatResult('put', result));
+		captureFrame('put /demo/message', result);
+		result = api.put('/demo/count', String(Date.now()));
+		print(formatResult('put', result));
+		captureFrame('put /demo/count', result);
+		result = api.put('/app/config/theme', 'green');
+		print(formatResult('put', result));
+		captureFrame('put /app/config/theme', result);
+		startWatchRefresh();
+	}
+
+	function runCommand(input) {
+		const api = ensureAPI();
+		const args = parseCommand(input);
+		const command = args[0]?.toLowerCase();
+		if (!command) return;
+
+		state.live = true;
+		showFrame(state.history.length - 1);
+		print(`t4> ${input}`);
+
+		let result;
+		if (command === 'help') {
+			print(helpText);
+			captureFrame('help', { ok: true });
+			return;
+		}
+		if (command === 'put') {
+			if (args.length < 3) throw new Error('usage: put <key> <value>');
+			result = api.put(args[1], args.slice(2).join(' '));
+		} else if (command === 'get') {
+			if (args.length < 2) throw new Error('usage: get <key>');
+			result = api.get(args[1]);
+		} else if (command === 'list') {
+			result = api.list(args[1] || '');
+		} else if (command === 'delete' || command === 'del' || command === 'rm') {
+			if (args.length < 2) throw new Error('usage: delete <key>');
+			result = api.delete(args[1]);
+		} else if (command === 'watch') {
+			result = api.watch(args[1] || '');
+			startWatchRefresh();
+		} else if (command === 'flush') {
+			result = api.flush();
+		} else if (command === 'fs') {
+			result = api.fs();
+		} else if (command === 'wal') {
+			result = api.wal();
+		} else if (command === 'events') {
+			result = api.events();
+		} else if (command === 'rev') {
+			result = api.revision();
+		} else if (command === 'reset') {
+			clearInterval(state.watchTimer);
+			state.watchTimer = null;
+			state.history = [];
+			state.frame = 0;
+			result = api.reset();
+		} else if (command === 'sample') {
+			runSample(api);
+			return;
+		} else if (command === 'live') {
+			showFrame(state.history.length - 1);
+			return;
+		} else {
+			throw new Error(`unknown command: ${command}`);
+		}
+
+		print(formatResult(command, result));
+		captureFrame(command, result);
+	}
+
+	els.form.addEventListener('submit', (event) => {
+		event.preventDefault();
+		const input = els.command.value.trim();
+		if (!input) return;
+		state.commandHistory.push(input);
+		state.commandIndex = state.commandHistory.length;
+		els.command.value = '';
+		try {
+			runCommand(input);
+		} catch (error) {
+			print(`error: ${error.message}`);
+			captureFrame('error', { ok: false, error: error.message });
+		}
+	});
+
+	els.command.addEventListener('keydown', (event) => {
+		if (event.key === 'ArrowUp') {
+			event.preventDefault();
+			state.commandIndex = Math.max(0, state.commandIndex - 1);
+			els.command.value = state.commandHistory[state.commandIndex] || '';
+		}
+		if (event.key === 'ArrowDown') {
+			event.preventDefault();
+			state.commandIndex = Math.min(state.commandHistory.length, state.commandIndex + 1);
+			els.command.value = state.commandHistory[state.commandIndex] || '';
+		}
+	});
+
+	els.playback.addEventListener('input', () => {
+		showFrame(Number(els.playback.value));
+	});
+
+	init().catch((error) => {
+		setText(els.status, 'Could not load T4 WASM.');
+		state.log = [error.stack || error.message];
+		renderLog(state.log);
+	});
+</script>
