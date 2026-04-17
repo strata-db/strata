@@ -1,4 +1,4 @@
-name: Deploy website
+name: Website
 
 on:
   push:
@@ -8,16 +8,20 @@ on:
       - 'website/**'
       - 'docs/**'
       - '.github/workflows/website.yml'
+  pull_request:
+    branches: ["**"]
+    paths:
+      - 'website/**'
+      - 'docs/**'
+      - '.github/workflows/website.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # Only one deployment runs at a time; don't cancel in-flight deployments.
 concurrency:
-  group: pages
+  group: website-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,6 +38,7 @@ jobs:
           cache-dependency-path: website/package-lock.json
 
       - uses: actions/configure-pages@v5
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         id: pages
 
       - name: Install dependencies
@@ -44,18 +49,23 @@ jobs:
         working-directory: website
         run: npm run build
         env:
-          SITE: ${{ steps.pages.outputs.origin }}
-          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          SITE: ${{ steps.pages.outputs.origin || 'https://t4db.github.io' }}
+          BASE_PATH: ${{ steps.pages.outputs.base_path || '/t4' }}
           PUBLIC_GA_MEASUREMENT_ID: ${{ vars.PUBLIC_GA_MEASUREMENT_ID }}
 
       - uses: actions/upload-pages-artifact@v3
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         with:
           path: website/dist
 
   deploy:
     name: Deploy
     needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
