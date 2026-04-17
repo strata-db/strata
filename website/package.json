@@ -4,9 +4,9 @@
   "version": "0.0.1",
   "scripts": {
     "build:playground": "node ./scripts/build-playground.mjs",
-    "dev": "node ./scripts/build-playground.mjs && astro dev",
-    "start": "node ./scripts/build-playground.mjs && astro dev",
-    "build": "node ./scripts/build-playground.mjs && astro build",
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "astro build",
     "preview": "astro preview",
     "astro": "astro"
   },
