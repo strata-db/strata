@@ -189,7 +189,9 @@ func (s *Server) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeReq
 		return resp, nil
 	}
 
-	// Range / prefix delete: list all keys under the prefix and delete matching ones.
+	// Range / prefix delete: list all keys in range and delete them in atomic
+	// Txn batches. This is O(1) WAL entries per batch instead of O(n), and each
+	// batch commits at a single revision.
 	prefix := key
 	if key == "\x00" {
 		prefix = ""
@@ -200,18 +202,41 @@ func (s *Server) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeReq
 	}
 	all = userKeyValues(all)
 
-	resp := &etcdserverpb.DeleteRangeResponse{Header: s.header()}
+	matched := all[:0]
 	for _, kv := range all {
 		if rangeEnd != "\x00" && kv.Key >= rangeEnd {
 			continue
 		}
-		if r.PrevKv {
-			resp.PrevKvs = append(resp.PrevKvs, kvToProto(kv))
+		matched = append(matched, kv)
+	}
+
+	resp := &etcdserverpb.DeleteRangeResponse{Header: s.header()}
+	if len(matched) == 0 {
+		return resp, nil
+	}
+
+	// Node.Txn caps at 65535 ops per branch; chunk to stay below.
+	const maxTxnOps = 65535
+	for i := 0; i < len(matched); i += maxTxnOps {
+		end := min(i+maxTxnOps, len(matched))
+		chunk := matched[i:end]
+		ops := make([]t4.TxnOp, len(chunk))
+		for j, kv := range chunk {
+			ops[j] = t4.TxnOp{Type: t4.TxnDelete, Key: kv.Key}
 		}
-		if _, err := s.node.Delete(ctx, kv.Key); err != nil {
+		txnResp, err := s.node.Txn(ctx, t4.TxnRequest{Success: ops})
+		if err != nil {
 			return nil, err
 		}
-		resp.Deleted++
+		for _, kv := range chunk {
+			if _, ok := txnResp.DeletedKeys[kv.Key]; !ok {
+				continue
+			}
+			if r.PrevKv {
+				resp.PrevKvs = append(resp.PrevKvs, kvToProto(kv))
+			}
+			resp.Deleted++
+		}
 	}
 	resp.Header = s.header()
 	return resp, nil
