@@ -45,7 +45,8 @@ jobs:
         env:
           TAG_NAME: ${{ steps.tag.outputs.tag_name }}
         run: |
-          echo "image_tag=${TAG_NAME//+/-}" >> "$GITHUB_OUTPUT"
+          image_tag="${TAG_NAME#v}"
+          echo "image_tag=${image_tag//+/-}" >> "$GITHUB_OUTPUT"
 
   build-image:
     name: Build tagged image
