@@ -128,6 +128,10 @@ t4 run --listen 0.0.0.0:3379
 | `T4_METRICS_ADDR`              | `--metrics-addr`              |
 | `T4_BRANCH_PREFIX`             | `--branch-prefix`             |
 | `T4_BRANCH_CHECKPOINT`         | `--branch-checkpoint`         |
+| `T4_GRPC_KEEPALIVE_MIN_TIME`             | `--grpc-keepalive-min-time`             |
+| `T4_GRPC_KEEPALIVE_INTERVAL`             | `--grpc-keepalive-interval`             |
+| `T4_GRPC_KEEPALIVE_TIMEOUT`              | `--grpc-keepalive-timeout`              |
+| `T4_GRPC_KEEPALIVE_PERMIT_WITHOUT_STREAM`| `--grpc-keepalive-permit-without-stream`|
 
 | Flag                          | Default          | Description                                                                                                                                                                                                                                                                        |
 |-------------------------------|------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -163,6 +167,10 @@ t4 run --listen 0.0.0.0:3379
 | `--metrics-addr`              | —                | HTTP address for metrics and health endpoints                                                                                                                                                                                                                                      |
 | `--branch-prefix`             | —                | S3 prefix of the source database (branch nodes only; uses `--s3-bucket`)                                                                                                                                                                                                           |
 | `--branch-checkpoint`         | —                | Checkpoint key to fork from (branch nodes only; omit to use latest)                                                                                                                                                                                                                |
+| `--grpc-keepalive-min-time`              | `5s`     | Minimum interval the server demands between client keepalive pings. Pings closer than this earn a strike; two strikes trigger `GOAWAY too_many_pings`. Lower than the etcd v3 client's 30s default; raising it risks connection resets for aggressive clients (kube-apiserver). |
+| `--grpc-keepalive-interval`              | `2h`     | Server-side keepalive ping interval. The server pings idle connections this often.                                                                                                                                                                                              |
+| `--grpc-keepalive-timeout`               | `20s`    | How long the server waits for a ping ack before declaring the connection dead.                                                                                                                                                                                                  |
+| `--grpc-keepalive-permit-without-stream` | `true`   | Accept client pings even when no streams are active. Required for etcd v3 client compatibility — etcd clients ping the connection itself, not a specific stream.                                                                                                                |
 
 ---
 

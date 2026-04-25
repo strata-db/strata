@@ -49,6 +49,14 @@ config:
   # Leader checkpoint frequency in minutes.
   checkpointIntervalMin: 15
 
+  # gRPC server keepalive policy. Defaults match real etcd; lowering these
+  # values risks `GOAWAY too_many_pings` for clients that ping aggressively.
+  # Pass plain Go duration strings (e.g. "5s", "20s", "2h").
+  grpcKeepaliveMinTime: "5s"
+  grpcKeepaliveInterval: "2h"
+  grpcKeepaliveTimeout: "20s"
+  grpcKeepalivePermitWithoutStream: true
+
   logLevel: info
 
 # ── S3 / object store ─────────────────────────────────────────────────────────

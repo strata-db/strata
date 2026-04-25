@@ -66,6 +66,10 @@ spec:
                 --segment-max-size-mb={{ .Values.config.segmentMaxSizeMb }} \
                 --segment-max-age-sec={{ .Values.config.segmentMaxAgeSec }} \
                 --checkpoint-interval-min={{ .Values.config.checkpointIntervalMin }} \
+                --grpc-keepalive-min-time={{ .Values.config.grpcKeepaliveMinTime | quote }} \
+                --grpc-keepalive-interval={{ .Values.config.grpcKeepaliveInterval | quote }} \
+                --grpc-keepalive-timeout={{ .Values.config.grpcKeepaliveTimeout | quote }} \
+                --grpc-keepalive-permit-without-stream={{ .Values.config.grpcKeepalivePermitWithoutStream }} \
                 {{- if gt (int .Values.replicaCount) 1 }}
                 --peer-listen={{ .Values.config.peerListenAddr | quote }} \
                 {{- if .Values.advertiseAddr }}

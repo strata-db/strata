@@ -11,6 +11,7 @@ package etcd
 import (
 	"context"
 	"sync"
+	"time"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
@@ -18,6 +19,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
@@ -42,18 +44,91 @@ func New(node *t4.Node, authStore *auth.Store, tokens *auth.TokenStore) *Server 
 	return s
 }
 
-// NewServerOptions returns the gRPC server options required for auth
-// enforcement (interceptors). Pass the returned options to grpc.NewServer.
-// When authStore is nil the returned options are empty (no-op).
-func NewServerOptions(authStore *auth.Store, tokens *auth.TokenStore) []grpc.ServerOption {
-	if authStore == nil {
-		return nil
+// KeepaliveOptions configures the gRPC server's HTTP/2 keepalive enforcement
+// and ping cadence. Field names mirror gRPC-Go's keepalive types and etcd's
+// CLI flags (--grpc-keepalive-{min-time,interval,timeout}).
+//
+// The defaults match real etcd. The values are intentionally compatible with
+// the etcd v3 client default (`DialKeepAliveTime: 30s`, PermitWithoutStream:
+// true): MinTime=5s leaves comfortable headroom; PermitWithoutStream=true
+// matches the client side so idle Watch streams aren't kicked.
+//
+// Without these defaults, gRPC-Go applies `MinTime: 5*time.Minute` /
+// `PermitWithoutStream: false`, which causes the server to send
+// `GOAWAY too_many_pings` against any etcd v3 client and drop in-flight RPCs.
+type KeepaliveOptions struct {
+	// MinTime is the minimum interval the server demands between client
+	// pings during a quiet stream. Pings closer than this earn a strike;
+	// two strikes trigger GOAWAY too_many_pings.
+	MinTime time.Duration
+
+	// PermitWithoutStream lets clients ping when no streams are active.
+	// Required because etcd clients ping the connection itself, not a
+	// specific stream.
+	PermitWithoutStream bool
+
+	// Time is the server-side keepalive ping interval (after this much
+	// inactivity, the server pings the client). Etcd uses 2h.
+	Time time.Duration
+
+	// Timeout is how long the server waits for a ping ack before declaring
+	// the connection dead.
+	Timeout time.Duration
+}
+
+// DefaultKeepaliveOptions returns the etcd-compatible defaults.
+func DefaultKeepaliveOptions() KeepaliveOptions {
+	return KeepaliveOptions{
+		MinTime:             5 * time.Second,
+		PermitWithoutStream: true,
+		Time:                2 * time.Hour,
+		Timeout:             20 * time.Second,
 	}
-	unary, stream := auth.Interceptors(authStore, tokens)
-	return []grpc.ServerOption{
-		grpc.UnaryInterceptor(unary),
-		grpc.StreamInterceptor(stream),
+}
+
+// Option configures NewServerOptions. Use WithKeepalive to override the
+// keepalive policy.
+type Option func(*serverConfig)
+
+type serverConfig struct {
+	keepalive KeepaliveOptions
+}
+
+// WithKeepalive sets the keepalive enforcement policy and server ping params.
+// Pass DefaultKeepaliveOptions() (with field overrides) for etcd-compatible
+// behaviour.
+func WithKeepalive(k KeepaliveOptions) Option {
+	return func(c *serverConfig) { c.keepalive = k }
+}
+
+// NewServerOptions returns the gRPC server options needed to host the
+// etcd v3 surface: auth interceptors (when authStore is non-nil) and a
+// keepalive enforcement policy compatible with etcd v3 clients.
+//
+// Defaults come from DefaultKeepaliveOptions; pass WithKeepalive to override.
+func NewServerOptions(authStore *auth.Store, tokens *auth.TokenStore, opts ...Option) []grpc.ServerOption {
+	cfg := serverConfig{keepalive: DefaultKeepaliveOptions()}
+	for _, o := range opts {
+		o(&cfg)
 	}
+	out := []grpc.ServerOption{
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             cfg.keepalive.MinTime,
+			PermitWithoutStream: cfg.keepalive.PermitWithoutStream,
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    cfg.keepalive.Time,
+			Timeout: cfg.keepalive.Timeout,
+		}),
+	}
+	if authStore != nil {
+		unary, stream := auth.Interceptors(authStore, tokens)
+		out = append(out,
+			grpc.UnaryInterceptor(unary),
+			grpc.StreamInterceptor(stream),
+		)
+	}
+	return out
 }
 
 // Register wires the etcd services onto srv.

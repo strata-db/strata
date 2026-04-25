@@ -26,7 +26,7 @@ func startEtcdServer(tb testing.TB, node *t4.Node) string {
 	if err != nil {
 		tb.Fatalf("listen: %v", err)
 	}
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(t4etcd.NewServerOptions(nil, nil)...)
 	t4etcd.New(node, nil, nil).Register(srv)
 	go srv.Serve(lis)
 	tb.Cleanup(srv.GracefulStop)

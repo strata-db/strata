@@ -61,6 +61,11 @@ func runCmd() *cobra.Command {
 		// branch node
 		branchPrefix     string
 		branchCheckpoint string
+		// gRPC keepalive (etcd-compatible defaults)
+		grpcKeepaliveMinTime             time.Duration
+		grpcKeepaliveTime                time.Duration
+		grpcKeepaliveTimeout             time.Duration
+		grpcKeepalivePermitWithoutStream bool
 	)
 
 	cmd := &cobra.Command{
@@ -213,7 +218,14 @@ func runCmd() *cobra.Command {
 				}
 			}
 
-			grpcOpts = append(grpcOpts, t4etcd.NewServerOptions(authStore, tokens)...)
+			grpcOpts = append(grpcOpts, t4etcd.NewServerOptions(authStore, tokens,
+				t4etcd.WithKeepalive(t4etcd.KeepaliveOptions{
+					MinTime:             grpcKeepaliveMinTime,
+					PermitWithoutStream: grpcKeepalivePermitWithoutStream,
+					Time:                grpcKeepaliveTime,
+					Timeout:             grpcKeepaliveTimeout,
+				}),
+			)...)
 
 			lis, err := net.Listen("tcp", listenAddr)
 			if err != nil {
@@ -277,34 +289,45 @@ func runCmd() *cobra.Command {
 	// branch node
 	cmd.Flags().StringVar(&branchPrefix, "branch-prefix", "", "S3 key prefix of the source node to branch from (uses --s3-bucket) (env: T4_BRANCH_PREFIX)")
 	cmd.Flags().StringVar(&branchCheckpoint, "branch-checkpoint", "", "checkpoint index key returned by 't4 branch fork' (required with --branch-prefix) (env: T4_BRANCH_CHECKPOINT)")
+	// gRPC keepalive — match etcd CLI flag names + defaults so etcd v3 clients
+	// (kube-apiserver, etcdctl) don't get GOAWAY too_many_pings.
+	defaultsKA := t4etcd.DefaultKeepaliveOptions()
+	cmd.Flags().DurationVar(&grpcKeepaliveMinTime, "grpc-keepalive-min-time", defaultsKA.MinTime, "minimum interval the server demands between client keepalive pings (env: T4_GRPC_KEEPALIVE_MIN_TIME)")
+	cmd.Flags().DurationVar(&grpcKeepaliveTime, "grpc-keepalive-interval", defaultsKA.Time, "server keepalive ping interval; how often the server pings idle connections (env: T4_GRPC_KEEPALIVE_INTERVAL)")
+	cmd.Flags().DurationVar(&grpcKeepaliveTimeout, "grpc-keepalive-timeout", defaultsKA.Timeout, "server keepalive ping ack timeout before declaring the connection dead (env: T4_GRPC_KEEPALIVE_TIMEOUT)")
+	cmd.Flags().BoolVar(&grpcKeepalivePermitWithoutStream, "grpc-keepalive-permit-without-stream", defaultsKA.PermitWithoutStream, "accept client pings even when no streams are open; required for etcd v3 client compatibility (env: T4_GRPC_KEEPALIVE_PERMIT_WITHOUT_STREAM)")
 	prependPreRunE(cmd, func(cmd *cobra.Command, _ []string) error {
 		return applyEnvVars(cmd, map[string]string{
-			"data-dir":                  "T4_DATA_DIR",
-			"listen":                    "T4_LISTEN",
-			"segment-max-size-mb":       "T4_SEGMENT_MAX_SIZE_MB",
-			"segment-max-age-sec":       "T4_SEGMENT_MAX_AGE_SEC",
-			"wal-sync-upload":           "T4_WAL_SYNC_UPLOAD",
-			"checkpoint-interval-min":   "T4_CHECKPOINT_INTERVAL_MIN",
-			"checkpoint-entries":        "T4_CHECKPOINT_ENTRIES",
-			"read-consistency":          "T4_READ_CONSISTENCY",
-			"log-level":                 "T4_LOG_LEVEL",
-			"node-id":                   "T4_NODE_ID",
-			"peer-listen":               "T4_PEER_LISTEN",
-			"advertise-peer":            "T4_ADVERTISE_PEER",
-			"leader-watch-interval-sec": "T4_LEADER_WATCH_INTERVAL_SEC",
-			"follower-max-retries":      "T4_FOLLOWER_MAX_RETRIES",
-			"follower-wait-mode":        "T4_FOLLOWER_WAIT_MODE",
-			"peer-tls-ca":               "T4_PEER_TLS_CA",
-			"peer-tls-cert":             "T4_PEER_TLS_CERT",
-			"peer-tls-key":              "T4_PEER_TLS_KEY",
-			"client-tls-cert":           "T4_CLIENT_TLS_CERT",
-			"client-tls-key":            "T4_CLIENT_TLS_KEY",
-			"client-tls-ca":             "T4_CLIENT_TLS_CA",
-			"auth-enabled":              "T4_AUTH_ENABLED",
-			"token-ttl":                 "T4_TOKEN_TTL",
-			"metrics-addr":              "T4_METRICS_ADDR",
-			"branch-prefix":             "T4_BRANCH_PREFIX",
-			"branch-checkpoint":         "T4_BRANCH_CHECKPOINT",
+			"data-dir":                             "T4_DATA_DIR",
+			"listen":                               "T4_LISTEN",
+			"segment-max-size-mb":                  "T4_SEGMENT_MAX_SIZE_MB",
+			"segment-max-age-sec":                  "T4_SEGMENT_MAX_AGE_SEC",
+			"wal-sync-upload":                      "T4_WAL_SYNC_UPLOAD",
+			"checkpoint-interval-min":              "T4_CHECKPOINT_INTERVAL_MIN",
+			"checkpoint-entries":                   "T4_CHECKPOINT_ENTRIES",
+			"read-consistency":                     "T4_READ_CONSISTENCY",
+			"log-level":                            "T4_LOG_LEVEL",
+			"node-id":                              "T4_NODE_ID",
+			"peer-listen":                          "T4_PEER_LISTEN",
+			"advertise-peer":                       "T4_ADVERTISE_PEER",
+			"leader-watch-interval-sec":            "T4_LEADER_WATCH_INTERVAL_SEC",
+			"follower-max-retries":                 "T4_FOLLOWER_MAX_RETRIES",
+			"follower-wait-mode":                   "T4_FOLLOWER_WAIT_MODE",
+			"peer-tls-ca":                          "T4_PEER_TLS_CA",
+			"peer-tls-cert":                        "T4_PEER_TLS_CERT",
+			"peer-tls-key":                         "T4_PEER_TLS_KEY",
+			"client-tls-cert":                      "T4_CLIENT_TLS_CERT",
+			"client-tls-key":                       "T4_CLIENT_TLS_KEY",
+			"client-tls-ca":                        "T4_CLIENT_TLS_CA",
+			"auth-enabled":                         "T4_AUTH_ENABLED",
+			"token-ttl":                            "T4_TOKEN_TTL",
+			"metrics-addr":                         "T4_METRICS_ADDR",
+			"branch-prefix":                        "T4_BRANCH_PREFIX",
+			"branch-checkpoint":                    "T4_BRANCH_CHECKPOINT",
+			"grpc-keepalive-min-time":              "T4_GRPC_KEEPALIVE_MIN_TIME",
+			"grpc-keepalive-interval":              "T4_GRPC_KEEPALIVE_INTERVAL",
+			"grpc-keepalive-timeout":               "T4_GRPC_KEEPALIVE_TIMEOUT",
+			"grpc-keepalive-permit-without-stream": "T4_GRPC_KEEPALIVE_PERMIT_WITHOUT_STREAM",
 		})
 	})
 
