@@ -290,7 +290,7 @@ func TestWatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 
-	ch, err := s.Watch(ctx, "/w/", 0)
+	ch, err := s.Watch(ctx, "/w/", 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func TestWatch(t *testing.T) {
 	}()
 
 	wantKeys := []string{"/w/x", "/w/y", "/w/x"}
-	wantDeleted := []bool{false, false, true}
+	wantTypes := []EventType{EventPut, EventPut, EventDelete}
 
 	for i := 0; i < 3; i++ {
 		select {
@@ -314,8 +314,8 @@ func TestWatch(t *testing.T) {
 			if ev.KV.Key != wantKeys[i] {
 				t.Errorf("event %d: key want %q got %q", i, wantKeys[i], ev.KV.Key)
 			}
-			if ev.Deleted != wantDeleted[i] {
-				t.Errorf("event %d: deleted want %v got %v", i, wantDeleted[i], ev.Deleted)
+			if ev.Type != wantTypes[i] {
+				t.Errorf("event %d: type want %v got %v", i, wantTypes[i], ev.Type)
 			}
 		case <-ctx.Done():
 			t.Fatalf("timeout waiting for watch event %d", i)
@@ -331,7 +331,7 @@ func TestWatchPrevKV(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 
-	ch, _ := s.Watch(ctx, "k", 1)
+	ch, _ := s.Watch(ctx, "k", 1, true)
 
 	go func() {
 		apply(t, s, updateEntry(2, "k", []byte("new"), 1, 1))
@@ -348,7 +348,7 @@ func TestWatchPrevKV(t *testing.T) {
 func TestWatchCancelStopsChannel(t *testing.T) {
 	s := openMem(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	ch, _ := s.Watch(ctx, "", 0)
+	ch, _ := s.Watch(ctx, "", 0, false)
 	cancel()
 
 	// Channel must close shortly after cancel.

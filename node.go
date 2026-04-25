@@ -846,9 +846,27 @@ func (n *Node) Flush() error {
 	return n.db.Load().Flush()
 }
 
+// WatchOption configures a Watch call. Use the With* helpers.
+type WatchOption func(*watchOpts)
+
+type watchOpts struct {
+	prevKV bool
+}
+
+// WithPrevKV requests that emitted events include the previous KV for updates
+// and deletes. Off by default: populating PrevKV adds one Pebble lookup per
+// non-create event, which is significant under high churn.
+func WithPrevKV() WatchOption {
+	return func(o *watchOpts) { o.prevKV = true }
+}
+
 // Watch streams prefix-matching events using etcd revision semantics:
 // startRev=0 means "from now"; startRev=N means replay from revision N (inclusive).
-func (n *Node) Watch(ctx context.Context, prefix string, startRev int64) (<-chan Event, error) {
+func (n *Node) Watch(ctx context.Context, prefix string, startRev int64, opts ...WatchOption) (<-chan Event, error) {
+	var o watchOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
 	if startRev > 0 && startRev <= n.db.Load().CompactRevision() {
 		return nil, ErrCompacted
 	}
@@ -858,44 +876,14 @@ func (n *Node) Watch(ctx context.Context, prefix string, startRev int64) (<-chan
 	if startRev == 0 {
 		storeStartRev = n.db.Load().CurrentRevision()
 	}
-	sch, err := n.db.Load().Watch(ctx, prefix, storeStartRev)
-	if err != nil {
-		return nil, err
-	}
-	out := make(chan Event, 64)
-	go func() {
-		defer close(out)
-		for ev := range sch {
-			et := EventPut
-			if ev.Deleted {
-				et = EventDelete
-			}
-			ne := Event{Type: et, KV: toKV(ev.KV)}
-			if ev.PrevKV != nil {
-				ne.PrevKV = toKV(ev.PrevKV)
-			}
-			select {
-			case out <- ne:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return out, nil
+	return n.db.Load().Watch(ctx, prefix, storeStartRev, o.prevKV)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-func toKV(sv *istore.KeyValue) *KeyValue {
-	if sv == nil {
-		return nil
-	}
-	return &KeyValue{
-		Key: sv.Key, Value: sv.Value, Revision: sv.Revision,
-		CreateRevision: sv.CreateRevision, PrevRevision: sv.PrevRevision,
-		Lease: sv.Lease,
-	}
-}
+// toKV is now identity since t4.KeyValue is an alias of istore.KeyValue.
+// Kept as a thin shim to preserve existing call sites.
+func toKV(sv *istore.KeyValue) *KeyValue { return sv }
 
 func makeUploader(obj object.Store, log Logger) wal.Uploader {
 	return func(ctx context.Context, localPath, objectKey string) error {

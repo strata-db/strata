@@ -598,7 +598,7 @@ func (s *Store) History(key string) ([]Event, error) {
 	if key == "" {
 		return nil, fmt.Errorf("store: history key must not be empty")
 	}
-	events, err := s.scanLog("", 1, atomic.LoadInt64(&s.currentRev))
+	events, err := s.scanLog("", 1, atomic.LoadInt64(&s.currentRev), true)
 	if err != nil {
 		return nil, err
 	}
@@ -626,28 +626,45 @@ func (s *Store) Changes(prefix string, fromRev, toRev int64) ([]Event, error) {
 	if toRev > currentRev {
 		toRev = currentRev
 	}
-	return s.scanLog(prefix, fromRev, toRev)
+	return s.scanLog(prefix, fromRev, toRev, true)
 }
 
 // --- Watch ---
 
+// EventType classifies a watch event.
+type EventType int
+
+const (
+	EventPut    EventType = iota // create or update
+	EventDelete                  // deletion
+)
+
 // Event is a single watch notification.
 type Event struct {
-	KV      *KeyValue
-	PrevKV  *KeyValue // nil for creates
-	Deleted bool
+	Type   EventType
+	KV     *KeyValue
+	PrevKV *KeyValue // nil for creates
 }
 
 // Watch streams events for keys matching prefix starting from startRev+1.
-// The channel is closed when ctx is cancelled.
-func (s *Store) Watch(ctx context.Context, prefix string, startRev int64) (<-chan Event, error) {
+// The channel is closed when ctx is cancelled. When withPrevKV is false,
+// emitted events have PrevKV == nil; this avoids one Pebble lookup per
+// non-create event in hot watch paths.
+//
+// The channel buffer is intentionally small. Backpressure should flow back to
+// scanLog quickly so a slow consumer doesn't accumulate large amounts of
+// converted events in memory and doesn't delay compaction by holding live
+// references to old revisions. The etcd handler's drain loop coalesces
+// whatever is immediately available into one WatchResponse, so a small buffer
+// still amortises gRPC Send overhead.
+func (s *Store) Watch(ctx context.Context, prefix string, startRev int64, withPrevKV bool) (<-chan Event, error) {
 	ch := make(chan Event, 64)
 	s.watcherWg.Add(1)
-	go s.watchLoop(ctx, prefix, startRev, ch)
+	go s.watchLoop(ctx, prefix, startRev, withPrevKV, ch)
 	return ch, nil
 }
 
-func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, ch chan<- Event) {
+func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, withPrevKV bool, ch chan<- Event) {
 	defer s.watcherWg.Done()
 	defer close(ch)
 
@@ -660,7 +677,7 @@ func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, ch
 		curRev := atomic.LoadInt64(&s.currentRev)
 
 		// Scan the log for events in [nextRev, curRev].
-		events, err := s.scanLog(prefix, nextRev, curRev)
+		events, err := s.scanLog(prefix, nextRev, curRev, withPrevKV)
 		if err != nil {
 			return
 		}
@@ -678,8 +695,9 @@ func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, ch
 }
 
 // scanLog reads log entries in [fromRev, toRev] and returns events for keys
-// matching prefix.
-func (s *Store) scanLog(prefix string, fromRev, toRev int64) ([]Event, error) {
+// matching prefix. When withPrevKV is false, the per-event PrevKV lookup is
+// skipped.
+func (s *Store) scanLog(prefix string, fromRev, toRev int64, withPrevKV bool) ([]Event, error) {
 	lower := logKey(fromRev)
 	upper := logKey(toRev + 1)
 
@@ -711,17 +729,21 @@ func (s *Store) scanLog(prefix string, fromRev, toRev int64) ([]Event, error) {
 			Lease:          r.lease,
 		}
 		var prevKV *KeyValue
-		if r.prevRevision > 0 {
+		if withPrevKV && r.prevRevision > 0 {
 			prevKV, err = s.getLogEntry(r.key, r.prevRevision)
 			if err != nil {
 				// Previous entry may have been compacted; non-fatal.
 				prevKV = nil
 			}
 		}
+		et := EventPut
+		if r.delete {
+			et = EventDelete
+		}
 		events = append(events, Event{
-			KV:      kv,
-			PrevKV:  prevKV,
-			Deleted: r.delete,
+			Type:   et,
+			KV:     kv,
+			PrevKV: prevKV,
 		})
 	}
 	return events, iter.Error()

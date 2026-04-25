@@ -1,27 +1,18 @@
 // Package t4 provides an embeddable, S3-durable key-value store.
 package t4
 
+import istore "github.com/t4db/t4/internal/store"
+
 // KeyValue is a versioned key-value pair.
-type KeyValue struct {
-	Key            string
-	Value          []byte
-	Revision       int64
-	CreateRevision int64
-	PrevRevision   int64
-	Lease          int64
-}
+type KeyValue = istore.KeyValue
 
 // EventType classifies a watch event.
-type EventType int
+type EventType = istore.EventType
 
 const (
-	EventPut    EventType = iota // create or update
-	EventDelete                  // deletion
+	EventPut    = istore.EventPut
+	EventDelete = istore.EventDelete
 )
 
 // Event is a single watch notification.
-type Event struct {
-	Type   EventType
-	KV     *KeyValue
-	PrevKV *KeyValue // nil for creates
-}
+type Event = istore.Event
