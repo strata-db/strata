@@ -12,7 +12,9 @@ package etcd_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -587,6 +589,54 @@ func TestCompatHeaderRevisionMonotonic(t *testing.T) {
 			t.Errorf("Put[%d]: revision %d not greater than previous %d", i, r.Header.Revision, last)
 		}
 		last = r.Header.Revision
+	}
+}
+
+func TestCompatPutHeaderMatchesStoredModRevisionUnderConcurrency(t *testing.T) {
+	_, cli := newCompatNode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	const writers = 16
+	const writesPerWriter = 50
+
+	errs := make(chan error, writers*writesPerWriter)
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < writesPerWriter; i++ {
+				key := fmt.Sprintf("/compat/concurrent-put/%02d/%02d", w, i)
+				resp, err := cli.Put(ctx, key, "value")
+				if err != nil {
+					errs <- fmt.Errorf("Put(%q): %w", key, err)
+					return
+				}
+				got, err := cli.Get(ctx, key)
+				if err != nil {
+					errs <- fmt.Errorf("Get(%q): %w", key, err)
+					return
+				}
+				if len(got.Kvs) != 1 {
+					errs <- fmt.Errorf("Get(%q): want 1 kv, got %d", key, len(got.Kvs))
+					return
+				}
+				if got.Kvs[0].ModRevision != resp.Header.Revision {
+					errs <- fmt.Errorf("Put(%q) header revision %d != stored mod revision %d",
+						key, resp.Header.Revision, got.Kvs[0].ModRevision)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

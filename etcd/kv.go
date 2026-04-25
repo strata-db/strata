@@ -139,7 +139,7 @@ func (s *Server) Put(ctx context.Context, r *etcdserverpb.PutRequest) (*etcdserv
 			return nil, err
 		}
 	}
-	resp := &etcdserverpb.PutResponse{Header: s.header()}
+	resp := &etcdserverpb.PutResponse{}
 
 	if r.PrevKv {
 		prev, err := s.node.Get(key)
@@ -151,10 +151,11 @@ func (s *Server) Put(ctx context.Context, r *etcdserverpb.PutRequest) (*etcdserv
 		}
 	}
 
-	if _, err := s.node.Put(ctx, key, r.Value, r.Lease); err != nil {
+	commitRev, err := s.node.Put(ctx, key, r.Value, r.Lease)
+	if err != nil {
 		return nil, err
 	}
-	resp.Header = s.header()
+	resp.Header = s.headerAt(commitRev)
 	return resp, nil
 }
 
@@ -168,7 +169,7 @@ func (s *Server) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeReq
 		if err := validateUserKey(key); err != nil {
 			return nil, err
 		}
-		resp := &etcdserverpb.DeleteRangeResponse{Header: s.header()}
+		resp := &etcdserverpb.DeleteRangeResponse{}
 		if r.PrevKv {
 			prev, err := s.node.Get(key)
 			if err != nil {
@@ -182,9 +183,13 @@ func (s *Server) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeReq
 		if err != nil {
 			return nil, err
 		}
-		resp.Header = s.header()
 		if newRev > 0 {
+			resp.Header = s.headerAt(newRev)
 			resp.Deleted = 1
+		} else {
+			// Key didn't exist — no commit. Return current revision so the
+			// client sees the cluster state at the moment of the no-op.
+			resp.Header = s.header()
 		}
 		return resp, nil
 	}
@@ -217,6 +222,7 @@ func (s *Server) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeReq
 
 	// Node.Txn caps at 65535 ops per branch; chunk to stay below.
 	const maxTxnOps = 65535
+	var lastCommitRev int64
 	for i := 0; i < len(matched); i += maxTxnOps {
 		end := min(i+maxTxnOps, len(matched))
 		chunk := matched[i:end]
@@ -228,6 +234,7 @@ func (s *Server) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeReq
 		if err != nil {
 			return nil, err
 		}
+		lastCommitRev = txnResp.Revision
 		for _, kv := range chunk {
 			if _, ok := txnResp.DeletedKeys[kv.Key]; !ok {
 				continue
@@ -238,7 +245,9 @@ func (s *Server) DeleteRange(ctx context.Context, r *etcdserverpb.DeleteRangeReq
 			resp.Deleted++
 		}
 	}
-	resp.Header = s.header()
+	if lastCommitRev > 0 {
+		resp.Header = s.headerAt(lastCommitRev)
+	}
 	return resp, nil
 }
 
@@ -294,13 +303,13 @@ func (s *Server) Txn(ctx context.Context, r *etcdserverpb.TxnRequest) (*etcdserv
 	if txnResp.Succeeded {
 		selectedBranch = r.Success
 	}
-	responses, err := s.buildTxnResponses(ctx, selectedBranch, txnResp.DeletedKeys)
+	responses, err := s.buildTxnResponses(ctx, selectedBranch, txnResp.DeletedKeys, txnResp.Revision)
 	if err != nil {
 		return nil, err
 	}
 
 	return &etcdserverpb.TxnResponse{
-		Header:    s.header(),
+		Header:    s.headerAt(txnResp.Revision),
 		Succeeded: txnResp.Succeeded,
 		Responses: responses,
 	}, nil
@@ -397,9 +406,13 @@ func convertWriteOps(ops []*etcdserverpb.RequestOp) ([]t4.TxnOp, error) {
 // buildTxnResponses builds the ResponseOp list for the selected transaction
 // branch. Write ops get responses based on the committed state; Range ops are
 // executed and their results included.
-func (s *Server) buildTxnResponses(ctx context.Context, ops []*etcdserverpb.RequestOp, deletedKeys map[string]struct{}) ([]*etcdserverpb.ResponseOp, error) {
+//
+// commitRev pins the inner Put / DeleteRange response headers to the actual
+// txn commit revision so callers (kube-apiserver) compute the new resource
+// version from a value that matches the key's mod_revision.
+func (s *Server) buildTxnResponses(ctx context.Context, ops []*etcdserverpb.RequestOp, deletedKeys map[string]struct{}, commitRev int64) ([]*etcdserverpb.ResponseOp, error) {
 	responses := make([]*etcdserverpb.ResponseOp, 0, len(ops))
-	hdr := s.header()
+	hdr := s.headerAt(commitRev)
 	for _, op := range ops {
 		switch v := op.GetRequest().(type) {
 		case *etcdserverpb.RequestOp_RequestPut:

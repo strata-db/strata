@@ -157,10 +157,23 @@ func (s *Server) Register(srv *grpc.Server) {
 // Any new RPC that exposes a revision on the wire must go through toEtcdRevision
 // (outgoing) or fromEtcdRevision (incoming) to stay consistent with this header.
 func (s *Server) header() *etcdserverpb.ResponseHeader {
+	return s.headerAt(s.node.CurrentRevision())
+}
+
+// headerAt builds a ResponseHeader pinned to a specific internal t4 revision.
+//
+// Mutating RPCs MUST use this with the commit revision returned by the node,
+// not the global CurrentRevision after the call. Reading CurrentRevision is
+// racy under concurrent writes — by the time the response is built another
+// transaction may have advanced the clock, and the caller's view (e.g. a
+// kube-apiserver computing the new resourceVersion) would diverge from the
+// actual mod_revision recorded for the key. That mismatch surfaces to clients
+// as "the object has been modified" 409 conflicts on the next Update.
+func (s *Server) headerAt(rev int64) *etcdserverpb.ResponseHeader {
 	return &etcdserverpb.ResponseHeader{
 		ClusterId: 1,
 		MemberId:  1,
-		Revision:  toEtcdRevision(s.node.CurrentRevision()),
+		Revision:  toEtcdRevision(rev),
 		RaftTerm:  1,
 	}
 }
