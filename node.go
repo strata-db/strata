@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 
 	"github.com/t4db/t4/internal/checkpoint"
@@ -131,6 +134,17 @@ type writeReq struct {
 	entry wal.Entry
 	done  chan error
 	ctx   context.Context
+	// OTel tracing: span is started by the write method and ended by await()
+	// after the commit loop signals. commitLoop fills the batch fields before
+	// sending to done so await() can record them as span attributes.
+	// walSpan and quorumSpan are child spans started inline in the commit loop's
+	// existing entries/broadcast loops and ended right after each phase.
+	span          trace.Span
+	walSpan       trace.Span
+	quorumSpan    trace.Span
+	walLatency    time.Duration
+	quorumLatency time.Duration
+	batchSize     int
 }
 
 func newWriteReq(ctx context.Context, e wal.Entry) *writeReq {
@@ -194,6 +208,7 @@ type Node struct {
 	entriesSinceCheckpoint int64
 	checkpointTriggerC     chan struct{}       // non-nil when CheckpointEntries > 0; signals entry-count-based checkpoint
 	sstUploader            *istore.SSTUploader // non-nil when ObjectStore is set; streams SSTs to S3
+	tracer                 trace.Tracer
 
 	// bgCtx is cancelled by cancelBg — either on Close() or when fencedCheck
 	// detects that this node has been superseded as leader. When cancelled with
@@ -533,6 +548,11 @@ func Open(cfg Config) (*Node, error) {
 	n.log = log
 	n.cp = cp
 	n.db.Store(db)
+	tp := cfg.TracerProvider
+	if tp == nil {
+		tp = otel.GetTracerProvider()
+	}
+	n.tracer = tp.Tracer("github.com/t4db/t4")
 	if cfg.CheckpointEntries > 0 {
 		n.checkpointTriggerC = make(chan struct{}, 1)
 	}
@@ -614,7 +634,7 @@ func (n *Node) electAndStart(bgCtx context.Context) error {
 	}
 
 	n.storeRole(roleFollower)
-	cli := peer.NewClient(rec.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log)
+	cli := peer.NewClient(rec.LeaderAddr, n.cfg.NodeID, n.cfg.FollowerMaxRetries, n.cfg.PeerClientTLS, n.log, n.cfg.TracerProvider)
 	n.peerCli = cli
 	n.leaderCli.Store(cli)
 	metrics.ElectionsTotal.WithLabelValues("lost").Inc()
@@ -746,7 +766,11 @@ func (n *Node) syncWithLeader(ctx context.Context) error {
 // LinearizableGet returns the value for key with linearizability guaranteed.
 // On a follower it syncs to the leader's revision before serving locally.
 func (n *Node) LinearizableGet(ctx context.Context, key string) (*KeyValue, error) {
+	ctx, span := n.tracer.Start(ctx, "t4.get",
+		trace.WithAttributes(attribute.String("key", key)))
+	defer span.End()
 	if err := n.syncWithLeader(ctx); err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 	return n.Get(key)
@@ -754,7 +778,11 @@ func (n *Node) LinearizableGet(ctx context.Context, key string) (*KeyValue, erro
 
 // LinearizableList returns all keys with the given prefix with linearizability guaranteed.
 func (n *Node) LinearizableList(ctx context.Context, prefix string) ([]*KeyValue, error) {
+	ctx, span := n.tracer.Start(ctx, "t4.list",
+		trace.WithAttributes(attribute.String("prefix", prefix)))
+	defer span.End()
 	if err := n.syncWithLeader(ctx); err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 	return n.List(prefix)
@@ -762,7 +790,11 @@ func (n *Node) LinearizableList(ctx context.Context, prefix string) ([]*KeyValue
 
 // LinearizableCount returns the count of keys with the given prefix with linearizability guaranteed.
 func (n *Node) LinearizableCount(ctx context.Context, prefix string) (int64, error) {
+	ctx, span := n.tracer.Start(ctx, "t4.count",
+		trace.WithAttributes(attribute.String("prefix", prefix)))
+	defer span.End()
 	if err := n.syncWithLeader(ctx); err != nil {
+		span.RecordError(err)
 		return 0, err
 	}
 	return n.Count(prefix)

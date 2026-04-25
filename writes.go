@@ -7,25 +7,44 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/t4db/t4/internal/metrics"
 	"github.com/t4db/t4/internal/peer"
 	istore "github.com/t4db/t4/internal/store"
 	"github.com/t4db/t4/internal/wal"
 )
 
+// endSpan records err on span (if non-nil) and calls End. Safe to call with a
+// noop span — the OTel noop implementation discards all calls cheaply.
+func endSpan(span trace.Span, err error) {
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
+	}
+	span.End()
+}
+
 // ── Write path (leader / single-node execute; follower forwards) ──────────────
 
 // Put creates or updates key with value. Returns the new revision.
 func (n *Node) Put(ctx context.Context, key string, value []byte, lease int64) (int64, error) {
+	ctx, span := n.tracer.Start(ctx, "t4.put", trace.WithAttributes(attribute.String("key", key)))
 	if n.closed.Load() {
+		endSpan(span, ErrClosed)
 		return 0, ErrClosed
 	}
 	if n.loadRole() == roleFollower {
 		resp, err := n.forwardWrite(ctx, &peer.ForwardRequest{Op: peer.ForwardPut, Key: key, Value: value, Lease: lease})
 		if err != nil {
+			endSpan(span, err)
 			return 0, err
 		}
-		return resp.Revision, decodeErr(resp.ErrCode, resp.ErrMsg)
+		fwdErr := decodeErr(resp.ErrCode, resp.ErrMsg)
+		endSpan(span, fwdErr)
+		return resp.Revision, fwdErr
 	}
 	n.fenceMu.RLock()
 	defer n.fenceMu.RUnlock()
@@ -33,14 +52,19 @@ func (n *Node) Put(ctx context.Context, key string, value []byte, lease int64) (
 	n.mu.Lock()
 	if n.closed.Load() {
 		n.mu.Unlock()
+		endSpan(span, ErrClosed)
 		return 0, ErrClosed
 	}
 	e, err := n.preparePut(key, value, lease)
 	if err != nil {
 		n.mu.Unlock()
+		endSpan(span, err)
 		return 0, err
 	}
 	req := newWriteReq(ctx, e)
+	if span.IsRecording() {
+		req.span = span
+	}
 	n.writeC <- req
 	n.mu.Unlock()
 	return n.await(ctx, req, opLabel(e.Op), start, key, e.Revision)
@@ -78,12 +102,16 @@ func (n *Node) preparePut(key string, value []byte, lease int64) (wal.Entry, err
 
 // Create creates key only if it does not already exist.
 func (n *Node) Create(ctx context.Context, key string, value []byte, lease int64) (int64, error) {
+	ctx, span := n.tracer.Start(ctx, "t4.create", trace.WithAttributes(attribute.String("key", key)))
 	if n.loadRole() == roleFollower {
 		resp, err := n.forwardWrite(ctx, &peer.ForwardRequest{Op: peer.ForwardCreate, Key: key, Value: value, Lease: lease})
 		if err != nil {
+			endSpan(span, err)
 			return 0, err
 		}
-		return resp.Revision, decodeErr(resp.ErrCode, resp.ErrMsg)
+		fwdErr := decodeErr(resp.ErrCode, resp.ErrMsg)
+		endSpan(span, fwdErr)
+		return resp.Revision, fwdErr
 	}
 	n.fenceMu.RLock()
 	defer n.fenceMu.RUnlock()
@@ -91,15 +119,18 @@ func (n *Node) Create(ctx context.Context, key string, value []byte, lease int64
 	n.mu.Lock()
 	if n.closed.Load() {
 		n.mu.Unlock()
+		endSpan(span, ErrClosed)
 		return 0, ErrClosed
 	}
 	existing, err := n.readKey(key)
 	if err != nil {
 		n.mu.Unlock()
+		endSpan(span, err)
 		return 0, err
 	}
 	if existing != nil {
 		n.mu.Unlock()
+		endSpan(span, ErrKeyExists)
 		return 0, ErrKeyExists
 	}
 	n.nextRev++
@@ -116,6 +147,9 @@ func (n *Node) Create(ctx context.Context, key string, value []byte, lease int64
 		Key: key, Value: value, Lease: lease, CreateRevision: newRev,
 	}
 	req := newWriteReq(ctx, e)
+	if span.IsRecording() {
+		req.span = span
+	}
 	n.writeC <- req
 	n.mu.Unlock()
 	return n.await(ctx, req, "create", start, key, newRev)
@@ -123,12 +157,16 @@ func (n *Node) Create(ctx context.Context, key string, value []byte, lease int64
 
 // Update updates key only if its current revision matches (CAS).
 func (n *Node) Update(ctx context.Context, key string, value []byte, revision, lease int64) (int64, *KeyValue, bool, error) {
+	ctx, span := n.tracer.Start(ctx, "t4.update", trace.WithAttributes(attribute.String("key", key)))
 	if n.loadRole() == roleFollower {
 		resp, err := n.forwardWrite(ctx, &peer.ForwardRequest{Op: peer.ForwardUpdate, Key: key, Value: value, Revision: revision, Lease: lease})
 		if err != nil {
+			endSpan(span, err)
 			return 0, nil, false, err
 		}
-		return resp.Revision, msgToKV(resp.OldKV), resp.Succeeded, decodeErr(resp.ErrCode, resp.ErrMsg)
+		fwdErr := decodeErr(resp.ErrCode, resp.ErrMsg)
+		endSpan(span, fwdErr)
+		return resp.Revision, msgToKV(resp.OldKV), resp.Succeeded, fwdErr
 	}
 	n.fenceMu.RLock()
 	defer n.fenceMu.RUnlock()
@@ -136,16 +174,19 @@ func (n *Node) Update(ctx context.Context, key string, value []byte, revision, l
 	n.mu.Lock()
 	if n.closed.Load() {
 		n.mu.Unlock()
+		endSpan(span, ErrClosed)
 		return 0, nil, false, ErrClosed
 	}
 	existing, err := n.readKey(key)
 	if err != nil {
 		n.mu.Unlock()
+		endSpan(span, err)
 		return 0, nil, false, err
 	}
 	if existing == nil || existing.Revision != revision {
 		curRev := n.db.Load().CurrentRevision()
 		n.mu.Unlock()
+		span.End() // CAS miss is not an error
 		return curRev, toKV(existing), false, nil
 	}
 	n.nextRev++
@@ -165,6 +206,9 @@ func (n *Node) Update(ctx context.Context, key string, value []byte, revision, l
 	}
 	oldKV := toKV(existing)
 	req := newWriteReq(ctx, e)
+	if span.IsRecording() {
+		req.span = span
+	}
 	n.writeC <- req
 	n.mu.Unlock()
 	newRev, err = n.await(ctx, req, "update", start, key, newRev)
@@ -176,12 +220,16 @@ func (n *Node) Update(ctx context.Context, key string, value []byte, revision, l
 
 // Delete removes key unconditionally.
 func (n *Node) Delete(ctx context.Context, key string) (int64, error) {
+	ctx, span := n.tracer.Start(ctx, "t4.delete", trace.WithAttributes(attribute.String("key", key)))
 	if n.loadRole() == roleFollower {
 		resp, err := n.forwardWrite(ctx, &peer.ForwardRequest{Op: peer.ForwardDeleteIfRevision, Key: key, Revision: 0})
 		if err != nil {
+			endSpan(span, err)
 			return 0, err
 		}
-		return resp.Revision, decodeErr(resp.ErrCode, resp.ErrMsg)
+		fwdErr := decodeErr(resp.ErrCode, resp.ErrMsg)
+		endSpan(span, fwdErr)
+		return resp.Revision, fwdErr
 	}
 	n.fenceMu.RLock()
 	defer n.fenceMu.RUnlock()
@@ -189,14 +237,19 @@ func (n *Node) Delete(ctx context.Context, key string) (int64, error) {
 	n.mu.Lock()
 	if n.closed.Load() {
 		n.mu.Unlock()
+		endSpan(span, ErrClosed)
 		return 0, ErrClosed
 	}
 	e, err := n.prepareDelete(key)
 	if err != nil || e.Key == "" {
 		n.mu.Unlock()
-		return 0, err // key not found — no-op
+		endSpan(span, err) // key not found is not an error; err may be nil
+		return 0, err
 	}
 	req := newWriteReq(ctx, e)
+	if span.IsRecording() {
+		req.span = span
+	}
 	n.writeC <- req
 	n.mu.Unlock()
 	return n.await(ctx, req, "delete", start, key, e.Revision)
@@ -204,12 +257,16 @@ func (n *Node) Delete(ctx context.Context, key string) (int64, error) {
 
 // DeleteIfRevision deletes key only if its current revision matches (CAS).
 func (n *Node) DeleteIfRevision(ctx context.Context, key string, revision int64) (int64, *KeyValue, bool, error) {
+	ctx, span := n.tracer.Start(ctx, "t4.delete_if_revision", trace.WithAttributes(attribute.String("key", key)))
 	if n.loadRole() == roleFollower {
 		resp, err := n.forwardWrite(ctx, &peer.ForwardRequest{Op: peer.ForwardDeleteIfRevision, Key: key, Revision: revision})
 		if err != nil {
+			endSpan(span, err)
 			return 0, nil, false, err
 		}
-		return resp.Revision, msgToKV(resp.OldKV), resp.Succeeded, decodeErr(resp.ErrCode, resp.ErrMsg)
+		fwdErr := decodeErr(resp.ErrCode, resp.ErrMsg)
+		endSpan(span, fwdErr)
+		return resp.Revision, msgToKV(resp.OldKV), resp.Succeeded, fwdErr
 	}
 	n.fenceMu.RLock()
 	defer n.fenceMu.RUnlock()
@@ -217,29 +274,37 @@ func (n *Node) DeleteIfRevision(ctx context.Context, key string, revision int64)
 	n.mu.Lock()
 	if n.closed.Load() {
 		n.mu.Unlock()
+		endSpan(span, ErrClosed)
 		return 0, nil, false, ErrClosed
 	}
 	existing, err := n.readKey(key)
 	if err != nil {
 		n.mu.Unlock()
+		endSpan(span, err)
 		return 0, nil, false, err
 	}
 	curRev := n.db.Load().CurrentRevision()
 	if existing == nil {
 		n.mu.Unlock()
+		span.End() // key absent — not an error
 		return curRev, nil, false, nil
 	}
 	if revision != 0 && existing.Revision != revision {
 		n.mu.Unlock()
+		span.End() // CAS miss — not an error
 		return curRev, toKV(existing), false, nil
 	}
 	oldKV := toKV(existing)
 	e, err := n.prepareDelete(key)
 	if err != nil || e.Key == "" {
 		n.mu.Unlock()
+		endSpan(span, err)
 		return 0, nil, false, err
 	}
 	req := newWriteReq(ctx, e)
+	if span.IsRecording() {
+		req.span = span
+	}
 	n.writeC <- req
 	n.mu.Unlock()
 	newRev, err := n.await(ctx, req, "delete", start, key, e.Revision)
@@ -351,23 +416,28 @@ func txnCondMatches(cond TxnCondition, existing *istore.KeyValue) bool {
 // All write ops within the selected branch share a single revision and are
 // committed to the WAL in one entry, ensuring crash-safe atomicity.
 func (n *Node) Txn(ctx context.Context, req TxnRequest) (TxnResponse, error) {
+	ctx, span := n.tracer.Start(ctx, "t4.txn")
 	if n.closed.Load() {
+		endSpan(span, ErrClosed)
 		return TxnResponse{}, ErrClosed
 	}
 	if n.loadRole() == roleFollower {
 		resp, err := n.forwardWrite(ctx, txnToForwardRequest(req))
 		if err != nil {
+			endSpan(span, err)
 			return TxnResponse{}, err
 		}
 		deletedKeys := make(map[string]struct{}, len(resp.DeletedKeys))
 		for _, k := range resp.DeletedKeys {
 			deletedKeys[k] = struct{}{}
 		}
+		fwdErr := decodeErr(resp.ErrCode, resp.ErrMsg)
+		endSpan(span, fwdErr)
 		return TxnResponse{
 			Succeeded:   resp.Succeeded,
 			Revision:    resp.Revision,
 			DeletedKeys: deletedKeys,
-		}, decodeErr(resp.ErrCode, resp.ErrMsg)
+		}, fwdErr
 	}
 	n.fenceMu.RLock()
 	defer n.fenceMu.RUnlock()
@@ -375,22 +445,24 @@ func (n *Node) Txn(ctx context.Context, req TxnRequest) (TxnResponse, error) {
 	n.mu.Lock()
 	if n.closed.Load() {
 		n.mu.Unlock()
+		endSpan(span, ErrClosed)
 		return TxnResponse{}, ErrClosed
 	}
 	e, succeeded, deletedKeys, err := n.prepareTxn(req)
 	if err != nil {
 		n.mu.Unlock()
+		endSpan(span, err)
 		return TxnResponse{}, err
 	}
 	if e.Op == 0 {
 		// No-op branch: conditions evaluated but no writes needed.
-		// Use the committed revision, not nextRev which may be ahead of what
-		// the commit loop has fsynced if concurrent writes are in flight.
 		curRev := n.db.Load().CurrentRevision()
 		n.mu.Unlock()
+		span.End() // no-op txn is not an error
 		return TxnResponse{Succeeded: succeeded, Revision: curRev}, nil
 	}
 	wr := newWriteReq(ctx, e)
+	wr.span = span
 	n.writeC <- wr
 	n.mu.Unlock()
 	rev, err := n.await(ctx, wr, "txn", start, "", e.Revision)
@@ -635,7 +707,31 @@ func opLabel(op wal.Op) string {
 // await waits for a commit-loop result. req must have been sent to writeC
 // before n.mu was released. key and rev identify the pending map entry to
 // remove once the commit completes (pass key=="" for Compact which has none).
-func (n *Node) await(ctx context.Context, req *writeReq, op string, start time.Time, key string, rev int64) (int64, error) {
+func (n *Node) await(ctx context.Context, req *writeReq, op string, start time.Time, key string, rev int64) (retRev int64, retErr error) {
+	// Copy timing fields from req into stack-local variables after req.done is
+	// received. The defer closure reads only these stack vars, never req fields
+	// directly — commitLoop writes req.batchSize/walLatency/quorumLatency just
+	// before sending req.done, so any early-exit path (ctx cancel) that returns
+	// before req.done is drained would cause a race if the defer read req fields.
+	var batchSize int
+	var walLatency, quorumLatency time.Duration
+	if req.span != nil {
+		defer func() {
+			if batchSize > 0 {
+				req.span.SetAttributes(
+					attribute.Int("t4.batch_size", batchSize),
+					attribute.Int64("t4.wal_latency_us", walLatency.Microseconds()),
+					attribute.Int64("t4.quorum_latency_us", quorumLatency.Microseconds()),
+				)
+			}
+			endSpan(req.span, retErr)
+		}()
+	}
+	copyTimingFromReq := func() {
+		batchSize = req.batchSize
+		walLatency = req.walLatency
+		quorumLatency = req.quorumLatency
+	}
 	cleanPending := func() {
 		if key != "" {
 			n.mu.Lock()
@@ -648,6 +744,7 @@ func (n *Node) await(ctx context.Context, req *writeReq, op string, start time.T
 	var err error
 	select {
 	case err = <-req.done:
+		copyTimingFromReq()
 	case <-ctx.Done():
 		// Give the commit loop a brief window to react: it may have already
 		// detected our cancellation (via batchCtx) and is about to signal us
@@ -658,6 +755,7 @@ func (n *Node) await(ctx context.Context, req *writeReq, op string, start time.T
 		defer timer.Stop()
 		select {
 		case err = <-req.done:
+			copyTimingFromReq()
 			// commit loop responded promptly; fall through to normal handling
 		case <-timer.C:
 			go func() { <-req.done; cleanPending() }()
@@ -712,12 +810,16 @@ func (n *Node) clearPendingBatch(batch []*writeReq) {
 
 // Compact removes log entries at or below revision.
 func (n *Node) Compact(ctx context.Context, revision int64) error {
+	ctx, span := n.tracer.Start(ctx, "t4.compact")
 	if n.loadRole() == roleFollower {
 		resp, err := n.forwardWrite(ctx, &peer.ForwardRequest{Op: peer.ForwardCompact, Revision: revision})
 		if err != nil {
+			endSpan(span, err)
 			return err
 		}
-		return decodeErr(resp.ErrCode, resp.ErrMsg)
+		fwdErr := decodeErr(resp.ErrCode, resp.ErrMsg)
+		endSpan(span, fwdErr)
+		return fwdErr
 	}
 	n.fenceMu.RLock()
 	defer n.fenceMu.RUnlock()
@@ -725,6 +827,7 @@ func (n *Node) Compact(ctx context.Context, revision int64) error {
 	n.mu.Lock()
 	if n.closed.Load() {
 		n.mu.Unlock()
+		endSpan(span, ErrClosed)
 		return ErrClosed
 	}
 	n.nextRev++
@@ -733,6 +836,9 @@ func (n *Node) Compact(ctx context.Context, revision int64) error {
 		PrevRevision: revision,
 	}
 	req := newWriteReq(ctx, e)
+	if span.IsRecording() {
+		req.span = span
+	}
 	n.writeC <- req
 	n.mu.Unlock()
 	_, err := n.await(ctx, req, "compact", start, "", e.Revision)

@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -34,6 +36,7 @@ type Client struct {
 	nodeID     string
 	maxRetries int                              // consecutive failures before ErrLeaderUnreachable (0 = unlimited)
 	tlsCreds   credentials.TransportCredentials // nil = plaintext
+	tp         trace.TracerProvider             // nil = no tracing
 
 	connMu sync.Mutex
 	conn   *grpc.ClientConn // lazily initialised; nil after Close
@@ -45,11 +48,13 @@ type Client struct {
 // maxRetries is the number of consecutive connection failures before Follow
 // returns ErrLeaderUnreachable. Use 0 for unlimited retries.
 // tlsCreds may be nil for plaintext (only safe on a trusted network).
-func NewClient(leaderAddr, nodeID string, maxRetries int, tlsCreds credentials.TransportCredentials, log peerLogger) *Client {
+// tp is the OTel TracerProvider for propagating trace context on forwarded
+// writes; nil disables tracing on the peer connection.
+func NewClient(leaderAddr, nodeID string, maxRetries int, tlsCreds credentials.TransportCredentials, log peerLogger, tp trace.TracerProvider) *Client {
 	if log == nil {
 		log = stdlibPeerLogger{}
 	}
-	return &Client{leaderAddr: leaderAddr, nodeID: nodeID, maxRetries: maxRetries, tlsCreds: tlsCreds, log: log}
+	return &Client{leaderAddr: leaderAddr, nodeID: nodeID, maxRetries: maxRetries, tlsCreds: tlsCreds, tp: tp, log: log}
 }
 
 // Close releases the underlying gRPC connection.
@@ -73,11 +78,16 @@ func (c *Client) getConn() (*grpc.ClientConn, error) {
 	if creds == nil {
 		creds = insecure.NewCredentials()
 	}
-	conn, err := grpc.NewClient(
-		c.leaderAddr,
+	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(creds),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(Codec{})),
-	)
+	}
+	if c.tp != nil {
+		dialOpts = append(dialOpts, grpc.WithStatsHandler(otelgrpc.NewClientHandler(
+			otelgrpc.WithTracerProvider(c.tp),
+		)))
+	}
+	conn, err := grpc.NewClient(c.leaderAddr, dialOpts...)
 	if err != nil {
 		return nil, err
 	}

@@ -81,8 +81,8 @@ kv, _  := node.Get("/config/timeout")
   <Card title="Zero-copy branching" icon="fork">
     Fork a database at any checkpoint without copying S3 objects. Shared SSTs are content-addressed and deduplicated automatically.
   </Card>
-  <Card title="Prometheus metrics" icon="information">
-    Built-in `/metrics`, `/healthz`, and `/readyz` endpoints. Drop into your existing observability stack.
+  <Card title="Observability built-in" icon="information">
+    Prometheus `/metrics`, `/healthz`, and `/readyz` endpoints plus OpenTelemetry distributed tracing — spans for every write and read, with WAL fsync and quorum wait timing attributes.
   </Card>
 </CardGrid>
 

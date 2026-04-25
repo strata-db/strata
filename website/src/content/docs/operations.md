@@ -415,6 +415,56 @@ The dashboard contains five sections:
 
 `op` label values: `put`, `create`, `update`, `delete`, `compact`.
 
+### Distributed tracing (OTel)
+
+T4 emits [OpenTelemetry](https://opentelemetry.io/) spans for all write and linearizable read operations. Spans propagate context from etcd gRPC clients all the way through T4's WAL and quorum wait internals.
+
+#### Embedded usage
+
+Pass a `TracerProvider` in `t4.Config`:
+
+```go
+tp := sdktrace.NewTracerProvider(
+    sdktrace.WithBatcher(otlpExporter),
+)
+node, err := t4.Open(t4.Config{
+    // ...
+    TracerProvider: tp,
+})
+```
+
+`nil` falls back to `otel.GetTracerProvider()`, so a globally-configured provider works without any `Config` change.
+
+#### etcd gRPC server
+
+When serving the etcd v3 protocol with `t4etcd.Register`, add `TracingOptions` to the gRPC server to propagate trace context from etcd clients:
+
+```go
+grpcOpts := t4etcd.NewServerOptions(authStore, tokens)
+grpcOpts = append(grpcOpts, t4etcd.TracingOptions(tp)...)
+srv := grpc.NewServer(grpcOpts...)
+etcdServer.Register(srv)
+```
+
+Pass `nil` to `TracingOptions` to use the global OTel provider.
+
+#### Spans and attributes
+
+| Span | Attributes |
+|---|---|
+| `t4.put` / `t4.create` / `t4.update` / `t4.delete` / `t4.compact` / `t4.txn` | `key` (or `prefix` for compact/txn) |
+| `t4.get` / `t4.list` / `t4.count` | `key` / `prefix` |
+
+All write spans set these attributes once the commit loop completes:
+
+| Attribute | Description |
+|---|---|
+| `t4.batch_size` | Number of writes in the same group-commit batch |
+| `t4.wal_latency_us` | WAL fsync duration in microseconds |
+| `t4.quorum_latency_us` | Time waiting for follower ACKs in microseconds (0 in single-node mode) |
+
+Errors are recorded with `span.RecordError` and the span status is set to `Error`.
+
 ---
 
 ## Performance

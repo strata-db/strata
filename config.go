@@ -7,6 +7,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/credentials"
 
 	"github.com/t4db/t4/internal/wal"
@@ -219,6 +220,13 @@ type Config struct {
 	// prometheus.Gatherer; otherwise /metrics falls back to
 	// prometheus.DefaultGatherer.
 	MetricsRegisterer prometheus.Registerer
+
+	// TracerProvider is the OTel TracerProvider used to create spans for
+	// internal operations (writes, reads, WAL, follower quorum waits).
+	// When nil, otel.GetTracerProvider() is used — a no-op unless the
+	// embedding application has configured a global provider. Pass
+	// trace.NewNoopTracerProvider() to explicitly disable tracing.
+	TracerProvider trace.TracerProvider
 }
 
 func (c *Config) setDefaults() {
