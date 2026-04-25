@@ -598,7 +598,7 @@ func (s *Store) History(key string) ([]Event, error) {
 	if key == "" {
 		return nil, fmt.Errorf("store: history key must not be empty")
 	}
-	events, err := s.scanLog("", 1, atomic.LoadInt64(&s.currentRev))
+	events, err := s.scanLog("", 1, atomic.LoadInt64(&s.currentRev), true)
 	if err != nil {
 		return nil, err
 	}
@@ -626,7 +626,7 @@ func (s *Store) Changes(prefix string, fromRev, toRev int64) ([]Event, error) {
 	if toRev > currentRev {
 		toRev = currentRev
 	}
-	return s.scanLog(prefix, fromRev, toRev)
+	return s.scanLog(prefix, fromRev, toRev, true)
 }
 
 // --- Watch ---
@@ -639,15 +639,17 @@ type Event struct {
 }
 
 // Watch streams events for keys matching prefix starting from startRev+1.
-// The channel is closed when ctx is cancelled.
-func (s *Store) Watch(ctx context.Context, prefix string, startRev int64) (<-chan Event, error) {
-	ch := make(chan Event, 64)
+// The channel is closed when ctx is cancelled. When withPrevKV is false,
+// emitted events have PrevKV == nil; this avoids one Pebble lookup per
+// non-create event in hot watch paths.
+func (s *Store) Watch(ctx context.Context, prefix string, startRev int64, withPrevKV bool) (<-chan Event, error) {
+	ch := make(chan Event, 1024)
 	s.watcherWg.Add(1)
-	go s.watchLoop(ctx, prefix, startRev, ch)
+	go s.watchLoop(ctx, prefix, startRev, withPrevKV, ch)
 	return ch, nil
 }
 
-func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, ch chan<- Event) {
+func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, withPrevKV bool, ch chan<- Event) {
 	defer s.watcherWg.Done()
 	defer close(ch)
 
@@ -660,7 +662,7 @@ func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, ch
 		curRev := atomic.LoadInt64(&s.currentRev)
 
 		// Scan the log for events in [nextRev, curRev].
-		events, err := s.scanLog(prefix, nextRev, curRev)
+		events, err := s.scanLog(prefix, nextRev, curRev, withPrevKV)
 		if err != nil {
 			return
 		}
@@ -678,8 +680,9 @@ func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, ch
 }
 
 // scanLog reads log entries in [fromRev, toRev] and returns events for keys
-// matching prefix.
-func (s *Store) scanLog(prefix string, fromRev, toRev int64) ([]Event, error) {
+// matching prefix. When withPrevKV is false, the per-event PrevKV lookup is
+// skipped.
+func (s *Store) scanLog(prefix string, fromRev, toRev int64, withPrevKV bool) ([]Event, error) {
 	lower := logKey(fromRev)
 	upper := logKey(toRev + 1)
 
@@ -711,7 +714,7 @@ func (s *Store) scanLog(prefix string, fromRev, toRev int64) ([]Event, error) {
 			Lease:          r.lease,
 		}
 		var prevKV *KeyValue
-		if r.prevRevision > 0 {
+		if withPrevKV && r.prevRevision > 0 {
 			prevKV, err = s.getLogEntry(r.key, r.prevRevision)
 			if err != nil {
 				// Previous entry may have been compacted; non-fatal.

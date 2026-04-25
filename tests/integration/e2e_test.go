@@ -156,7 +156,7 @@ func TestE2EOffline(t *testing.T) {
 	// Watch.
 	watchCtx, wcancel := context.WithTimeout(ctx, 5*time.Second)
 	defer wcancel()
-	ch, err := n.Watch(watchCtx, "/e2e/watch/", 0)
+	ch, err := n.Watch(watchCtx, "/e2e/watch/", 0, false)
 	if err != nil {
 		t.Fatalf("Watch: %v", err)
 	}

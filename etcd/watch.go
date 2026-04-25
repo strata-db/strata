@@ -95,7 +95,7 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 
 			go func(watchID int64, startRev int64) {
 				scanPrefix, match := watchScan(cr)
-				events, err := s.node.Watch(wctx, scanPrefix, fromEtcdRevision(startRev))
+				events, err := s.node.Watch(wctx, scanPrefix, fromEtcdRevision(startRev), cr.PrevKv)
 				if errors.Is(err, t4.ErrCompacted) {
 					// Remove the watch first, but do not cancel wctx before sending
 					// the compacted response: that races the select below and can
@@ -125,30 +125,75 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 					defer progressTicker.Stop()
 				}
 
+				// Coalesce close-arriving events into a single WatchResponse.
+				// Real etcd batches events on the wire; per-event Send is the
+				// dominant cost under high churn. maxBatch caps memory of a
+				// single response and matches a typical apiserver watch frame.
+				const maxBatch = 256
+				batch := make([]*mvccpb.Event, 0, maxBatch)
+				flush := func() bool {
+					if len(batch) == 0 {
+						return true
+					}
+					resp := &etcdserverpb.WatchResponse{
+						Header:  s.header(),
+						WatchId: watchID,
+						Events:  batch,
+					}
+					batch = make([]*mvccpb.Event, 0, maxBatch)
+					select {
+					case sendCh <- resp:
+						return true
+					case <-wctx.Done():
+						return false
+					}
+				}
+				appendEvent := func(e t4.Event) bool {
+					if !match(e.KV.Key) {
+						return true
+					}
+					e, ok := userEvent(e)
+					if !ok {
+						return true
+					}
+					batch = append(batch, eventToProto(e))
+					return true
+				}
+
 				for {
 					select {
 					case e, ok := <-events:
 						if !ok {
+							flush()
 							return
 						}
-						if !match(e.KV.Key) {
-							continue
+						if !appendEvent(e) {
+							return
 						}
-						e, ok = userEvent(e)
-						if !ok {
-							continue
+						// Drain any other ready events without blocking so a
+						// burst from scanLog ships in one frame.
+					drain:
+						for len(batch) < maxBatch {
+							select {
+							case e2, ok2 := <-events:
+								if !ok2 {
+									flush()
+									return
+								}
+								if !appendEvent(e2) {
+									return
+								}
+							default:
+								break drain
+							}
 						}
-						resp := &etcdserverpb.WatchResponse{
-							Header:  s.header(),
-							WatchId: watchID,
-							Events:  []*mvccpb.Event{eventToProto(e)},
-						}
-						select {
-						case sendCh <- resp:
-						case <-wctx.Done():
+						if !flush() {
 							return
 						}
 					case <-progressC:
+						if !flush() {
+							return
+						}
 						select {
 						case sendCh <- &etcdserverpb.WatchResponse{Header: s.header(), WatchId: watchID}:
 						case <-wctx.Done():

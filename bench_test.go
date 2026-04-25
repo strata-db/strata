@@ -219,7 +219,7 @@ func BenchmarkWatch(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
 	b.Cleanup(cancel)
 
-	ch, err := n.Watch(ctx, "/bench/watch/", 0)
+	ch, err := n.Watch(ctx, "/bench/watch/", 0, false)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -479,7 +479,7 @@ func BenchmarkWatchLatencyPercentiles(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
 	b.Cleanup(cancel)
 
-	ch, err := n.Watch(ctx, "/bench/watchpct/", 0)
+	ch, err := n.Watch(ctx, "/bench/watchpct/", 0, false)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -514,7 +514,7 @@ func BenchmarkWatchScaled(b *testing.B) {
 			// Open n watchers on the same prefix so every write fans out to all.
 			channels := make([]<-chan t4.Event, n)
 			for i := 0; i < n; i++ {
-				ch, err := node.Watch(ctx, "/bench/watchscaled/", 0)
+				ch, err := node.Watch(ctx, "/bench/watchscaled/", 0, false)
 				if err != nil {
 					b.Fatalf("Watch %d: %v", i, err)
 				}

@@ -848,7 +848,9 @@ func (n *Node) Flush() error {
 
 // Watch streams prefix-matching events using etcd revision semantics:
 // startRev=0 means "from now"; startRev=N means replay from revision N (inclusive).
-func (n *Node) Watch(ctx context.Context, prefix string, startRev int64) (<-chan Event, error) {
+// When withPrevKV is false, emitted events have PrevKV == nil; this skips one
+// Pebble lookup per non-create event and is meaningful under high churn.
+func (n *Node) Watch(ctx context.Context, prefix string, startRev int64, withPrevKV bool) (<-chan Event, error) {
 	if startRev > 0 && startRev <= n.db.Load().CompactRevision() {
 		return nil, ErrCompacted
 	}
@@ -858,11 +860,11 @@ func (n *Node) Watch(ctx context.Context, prefix string, startRev int64) (<-chan
 	if startRev == 0 {
 		storeStartRev = n.db.Load().CurrentRevision()
 	}
-	sch, err := n.db.Load().Watch(ctx, prefix, storeStartRev)
+	sch, err := n.db.Load().Watch(ctx, prefix, storeStartRev, withPrevKV)
 	if err != nil {
 		return nil, err
 	}
-	out := make(chan Event, 64)
+	out := make(chan Event, 1024)
 	go func() {
 		defer close(out)
 		for ev := range sch {
