@@ -876,44 +876,14 @@ func (n *Node) Watch(ctx context.Context, prefix string, startRev int64, opts ..
 	if startRev == 0 {
 		storeStartRev = n.db.Load().CurrentRevision()
 	}
-	sch, err := n.db.Load().Watch(ctx, prefix, storeStartRev, o.prevKV)
-	if err != nil {
-		return nil, err
-	}
-	out := make(chan Event, 1024)
-	go func() {
-		defer close(out)
-		for ev := range sch {
-			et := EventPut
-			if ev.Deleted {
-				et = EventDelete
-			}
-			ne := Event{Type: et, KV: toKV(ev.KV)}
-			if ev.PrevKV != nil {
-				ne.PrevKV = toKV(ev.PrevKV)
-			}
-			select {
-			case out <- ne:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return out, nil
+	return n.db.Load().Watch(ctx, prefix, storeStartRev, o.prevKV)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-func toKV(sv *istore.KeyValue) *KeyValue {
-	if sv == nil {
-		return nil
-	}
-	return &KeyValue{
-		Key: sv.Key, Value: sv.Value, Revision: sv.Revision,
-		CreateRevision: sv.CreateRevision, PrevRevision: sv.PrevRevision,
-		Lease: sv.Lease,
-	}
-}
+// toKV is now identity since t4.KeyValue is an alias of istore.KeyValue.
+// Kept as a thin shim to preserve existing call sites.
+func toKV(sv *istore.KeyValue) *KeyValue { return sv }
 
 func makeUploader(obj object.Store, log Logger) wal.Uploader {
 	return func(ctx context.Context, localPath, objectKey string) error {

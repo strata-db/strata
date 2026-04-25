@@ -250,7 +250,7 @@ func inspectHistoryCmd() *cobra.Command {
 			fmt.Fprintln(w, "REV\tTYPE\tCREATE\tPREV\tLEASE\tVALUE")
 			for _, ev := range events {
 				changeType := "put"
-				if ev.Deleted {
+				if ev.Type == istore.EventDelete {
 					changeType = "delete"
 				}
 				fmt.Fprintf(w, "%d\t%s\t%d\t%d\t%d\t%s\n",
@@ -407,7 +407,7 @@ func summarizeChanges(events []istore.Event) []inspectChange {
 			cur.before = ev.PrevKV
 			cur.seen = true
 		}
-		if ev.Deleted {
+		if ev.Type == istore.EventDelete {
 			cur.after = nil
 		} else {
 			cur.after = ev.KV

@@ -306,7 +306,7 @@ func TestWatch(t *testing.T) {
 	}()
 
 	wantKeys := []string{"/w/x", "/w/y", "/w/x"}
-	wantDeleted := []bool{false, false, true}
+	wantTypes := []EventType{EventPut, EventPut, EventDelete}
 
 	for i := 0; i < 3; i++ {
 		select {
@@ -314,8 +314,8 @@ func TestWatch(t *testing.T) {
 			if ev.KV.Key != wantKeys[i] {
 				t.Errorf("event %d: key want %q got %q", i, wantKeys[i], ev.KV.Key)
 			}
-			if ev.Deleted != wantDeleted[i] {
-				t.Errorf("event %d: deleted want %v got %v", i, wantDeleted[i], ev.Deleted)
+			if ev.Type != wantTypes[i] {
+				t.Errorf("event %d: type want %v got %v", i, wantTypes[i], ev.Type)
 			}
 		case <-ctx.Done():
 			t.Fatalf("timeout waiting for watch event %d", i)

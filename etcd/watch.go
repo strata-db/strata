@@ -12,11 +12,21 @@ import (
 	"github.com/t4db/t4"
 )
 
+// Maximum events coalesced into a single WatchResponse frame. Real etcd
+// batches events on the wire; per-event Send is the dominant cost under high
+// churn. 256 keeps frame size bounded while letting bursty scanLog output
+// ship in one round trip.
+const watchMaxBatch = 256
+
 // Watch implements WatchServer.Watch (bidirectional streaming).
+//
+// One stream multiplexes many watches. gRPC requires that Send on a stream is
+// not invoked concurrently, so all responses funnel through sendCh. Each
+// watch runs in its own goroutine (runWatch) that drains events from the
+// underlying t4.Node.Watch channel into batched WatchResponses.
 func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 	ctx := stream.Context()
 
-	// All sends are serialized through sendCh to avoid concurrent SendMsg calls.
 	sendCh := make(chan *etcdserverpb.WatchResponse, 128)
 	go func() {
 		for {
@@ -29,36 +39,20 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 		}
 	}()
 
-	type entry struct{ cancel context.CancelFunc }
-	var watchesMu sync.Mutex
-	watches := map[int64]entry{}
+	var watches sync.Map // map[int64]context.CancelFunc
 	var nextID int64 = 1
-	watchIDs := func() []int64 {
-		watchesMu.Lock()
-		ids := make([]int64, 0, len(watches))
-		for id := range watches {
-			ids = append(ids, id)
-		}
-		watchesMu.Unlock()
-		return ids
-	}
-	removeWatch := func(id int64) (context.CancelFunc, bool) {
-		watchesMu.Lock()
-		w, ok := watches[id]
-		if ok {
-			delete(watches, id)
-		}
-		watchesMu.Unlock()
-		if !ok {
-			return nil, false
-		}
-		return w.cancel, true
-	}
+
+	defer func() {
+		watches.Range(func(_, v any) bool {
+			v.(context.CancelFunc)()
+			return true
+		})
+	}()
 
 	for {
 		req, err := stream.Recv()
 		if err != nil {
-			break
+			return nil
 		}
 
 		switch v := req.RequestUnion.(type) {
@@ -73,7 +67,7 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 					CancelReason: "reserved internal prefix is not watchable",
 				}:
 				case <-ctx.Done():
-					goto done
+					return nil
 				}
 				continue
 			}
@@ -81,167 +75,176 @@ func (s *Server) Watch(stream etcdserverpb.Watch_WatchServer) error {
 			nextID++
 
 			wctx, cancel := context.WithCancel(ctx)
-			watchesMu.Lock()
-			watches[id] = entry{cancel}
-			watchesMu.Unlock()
 
-			// Confirm the watch was created.
-			select {
-			case sendCh <- &etcdserverpb.WatchResponse{Header: s.header(), WatchId: id, Created: true}:
-			case <-ctx.Done():
+			// runWatch subscribes synchronously and spawns its own drain
+			// goroutine. The only spontaneous failure path is ErrCompacted at
+			// subscribe time; everything else (parent ctx cancel, client
+			// Cancel) flows through wctx and is handled by the parent.
+			err := s.runWatch(wctx, id, cr, sendCh)
+			if err != nil {
 				cancel()
-				goto done
-			}
-
-			go func(watchID int64, startRev int64) {
-				scanPrefix, match := watchScan(cr)
-				var watchOpts []t4.WatchOption
-				if cr.PrevKv {
-					watchOpts = append(watchOpts, t4.WithPrevKV())
-				}
-				events, err := s.node.Watch(wctx, scanPrefix, fromEtcdRevision(startRev), watchOpts...)
 				if errors.Is(err, t4.ErrCompacted) {
-					// Remove the watch first, but do not cancel wctx before sending
-					// the compacted response: that races the select below and can
-					// drop the required canceled notification.
-					_, _ = removeWatch(watchID)
 					select {
 					case sendCh <- &etcdserverpb.WatchResponse{
 						Header:          s.header(),
-						WatchId:         watchID,
+						WatchId:         id,
+						Created:         true,
 						Canceled:        true,
 						CancelReason:    "mvcc: required revision has been compacted",
 						CompactRevision: toEtcdRevision(s.node.CompactRevision()),
 					}:
 					case <-ctx.Done():
+						return nil
 					}
-					return
 				}
-				if err != nil {
-					return
-				}
+				continue
+			}
 
-				var progressC <-chan time.Time
-				var progressTicker *time.Ticker
-				if cr.ProgressNotify {
-					progressTicker = time.NewTicker(time.Second)
-					progressC = progressTicker.C
-					defer progressTicker.Stop()
-				}
+			watches.Store(id, context.CancelFunc(cancel))
 
-				// Coalesce close-arriving events into a single WatchResponse.
-				// Real etcd batches events on the wire; per-event Send is the
-				// dominant cost under high churn. maxBatch caps memory of a
-				// single response and matches a typical apiserver watch frame.
-				const maxBatch = 256
-				batch := make([]*mvccpb.Event, 0, maxBatch)
-				flush := func() bool {
-					if len(batch) == 0 {
-						return true
-					}
-					resp := &etcdserverpb.WatchResponse{
-						Header:  s.header(),
-						WatchId: watchID,
-						Events:  batch,
-					}
-					batch = make([]*mvccpb.Event, 0, maxBatch)
-					select {
-					case sendCh <- resp:
-						return true
-					case <-wctx.Done():
-						return false
-					}
-				}
-				appendEvent := func(e t4.Event) bool {
-					if !match(e.KV.Key) {
-						return true
-					}
-					e, ok := userEvent(e)
-					if !ok {
-						return true
-					}
-					batch = append(batch, eventToProto(e))
-					return true
-				}
-
-				for {
-					select {
-					case e, ok := <-events:
-						if !ok {
-							flush()
-							return
-						}
-						if !appendEvent(e) {
-							return
-						}
-						// Drain any other ready events without blocking so a
-						// burst from scanLog ships in one frame.
-					drain:
-						for len(batch) < maxBatch {
-							select {
-							case e2, ok2 := <-events:
-								if !ok2 {
-									flush()
-									return
-								}
-								if !appendEvent(e2) {
-									return
-								}
-							default:
-								break drain
-							}
-						}
-						if !flush() {
-							return
-						}
-					case <-progressC:
-						if !flush() {
-							return
-						}
-						select {
-						case sendCh <- &etcdserverpb.WatchResponse{Header: s.header(), WatchId: watchID}:
-						case <-wctx.Done():
-							return
-						}
-					case <-wctx.Done():
-						return
-					}
-				}
-			}(id, cr.StartRevision)
+			select {
+			case sendCh <- &etcdserverpb.WatchResponse{Header: s.header(), WatchId: id, Created: true}:
+			case <-ctx.Done():
+				cancel()
+				return nil
+			}
 
 		case *etcdserverpb.WatchRequest_CancelRequest:
 			id := v.CancelRequest.WatchId
-			if cancel, ok := removeWatch(id); ok {
-				cancel()
+			if c, ok := watches.LoadAndDelete(id); ok {
+				c.(context.CancelFunc)()
 				select {
 				case sendCh <- &etcdserverpb.WatchResponse{Header: s.header(), WatchId: id, Canceled: true}:
 				case <-ctx.Done():
-					goto done
+					return nil
 				}
 			}
 		case *etcdserverpb.WatchRequest_ProgressRequest:
-			for _, id := range watchIDs() {
+			watches.Range(func(k, _ any) bool {
 				select {
-				case sendCh <- &etcdserverpb.WatchResponse{Header: s.header(), WatchId: id}:
+				case sendCh <- &etcdserverpb.WatchResponse{Header: s.header(), WatchId: k.(int64)}:
 				case <-ctx.Done():
-					goto done
+					return false
 				}
-			}
+				return true
+			})
 		}
 	}
+}
 
-done:
-	watchesMu.Lock()
-	all := make([]entry, 0, len(watches))
-	for _, w := range watches {
-		all = append(all, w)
+// runWatch subscribes to t4.Node.Watch synchronously and, on success, spawns
+// a goroutine that drains events into batched WatchResponse frames. Subscribe
+// errors (ErrCompacted, etc.) are returned to the caller; the drain goroutine
+// then has only two exit paths: wctx cancelled or events channel closed.
+func (s *Server) runWatch(wctx context.Context, watchID int64, cr *etcdserverpb.WatchCreateRequest, sendCh chan<- *etcdserverpb.WatchResponse) error {
+	scanPrefix, match := watchScan(cr)
+	var watchOpts []t4.WatchOption
+	if cr.PrevKv {
+		watchOpts = append(watchOpts, t4.WithPrevKV())
 	}
-	watches = map[int64]entry{}
-	watchesMu.Unlock()
-	for _, w := range all {
-		w.cancel()
+	events, err := s.node.Watch(wctx, scanPrefix, fromEtcdRevision(cr.StartRevision), watchOpts...)
+	if err != nil {
+		return err
 	}
+	go s.drainWatch(wctx, watchID, cr.ProgressNotify, events, match, sendCh)
 	return nil
+}
+
+// drainWatch reads events, coalesces them into a single WatchResponse per
+// burst, and forwards through sendCh until wctx is done or events closes.
+func (s *Server) drainWatch(wctx context.Context, watchID int64, progressNotify bool, events <-chan t4.Event, match func(string) bool, sendCh chan<- *etcdserverpb.WatchResponse) {
+	var progressC <-chan time.Time
+	if progressNotify {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		progressC = t.C
+	}
+
+	batch := make([]*mvccpb.Event, 0, watchMaxBatch)
+	// batchMaxRev tracks the highest revision observed since the last flush.
+	// progressRev is the rev we have actually delivered to the watcher so far.
+	// WatchResponse Header.Revision must reflect events included in this frame,
+	// not the live node clock — apiserver uses the header rev to advance its
+	// watchCache, and if it leapfrogs past events that arrive in a later frame,
+	// those events are silently dropped from the cache.
+	var batchMaxRev, progressRev int64
+	flush := func() bool {
+		if len(batch) == 0 {
+			return true
+		}
+		resp := &etcdserverpb.WatchResponse{
+			Header:  s.headerAt(batchMaxRev),
+			WatchId: watchID,
+			Events:  batch,
+		}
+		batch = make([]*mvccpb.Event, 0, watchMaxBatch)
+		progressRev = batchMaxRev
+		batchMaxRev = 0
+		select {
+		case sendCh <- resp:
+			return true
+		case <-wctx.Done():
+			return false
+		}
+	}
+	appendEvent := func(e t4.Event) {
+		// Track every observed revision, even ones we filter out, so the
+		// header rev reflects how far this watch has actually scanned.
+		if e.KV != nil && e.KV.Revision > batchMaxRev {
+			batchMaxRev = e.KV.Revision
+		}
+		if !match(e.KV.Key) {
+			return
+		}
+		ev, ok := userEvent(e)
+		if !ok {
+			return
+		}
+		batch = append(batch, eventToProto(ev))
+	}
+
+	for {
+		select {
+		case e, ok := <-events:
+			if !ok {
+				flush()
+				return
+			}
+			appendEvent(e)
+			// Drain everything else already buffered so a burst from scanLog
+			// ships in one frame.
+		drain:
+			for len(batch) < watchMaxBatch {
+				select {
+				case e2, ok2 := <-events:
+					if !ok2 {
+						flush()
+						return
+					}
+					appendEvent(e2)
+				default:
+					break drain
+				}
+			}
+			if !flush() {
+				return
+			}
+		case <-progressC:
+			if !flush() {
+				return
+			}
+			// Pin the progress notification to the rev we have actually
+			// delivered. Claiming a higher rev would let apiserver advance
+			// its watchCache past undelivered events.
+			select {
+			case sendCh <- &etcdserverpb.WatchResponse{Header: s.headerAt(progressRev), WatchId: watchID}:
+			case <-wctx.Done():
+				return
+			}
+		case <-wctx.Done():
+			return
+		}
+	}
 }
 
 func watchScan(cr *etcdserverpb.WatchCreateRequest) (string, func(string) bool) {

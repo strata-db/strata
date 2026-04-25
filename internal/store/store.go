@@ -631,11 +631,19 @@ func (s *Store) Changes(prefix string, fromRev, toRev int64) ([]Event, error) {
 
 // --- Watch ---
 
+// EventType classifies a watch event.
+type EventType int
+
+const (
+	EventPut    EventType = iota // create or update
+	EventDelete                  // deletion
+)
+
 // Event is a single watch notification.
 type Event struct {
-	KV      *KeyValue
-	PrevKV  *KeyValue // nil for creates
-	Deleted bool
+	Type   EventType
+	KV     *KeyValue
+	PrevKV *KeyValue // nil for creates
 }
 
 // Watch streams events for keys matching prefix starting from startRev+1.
@@ -721,10 +729,14 @@ func (s *Store) scanLog(prefix string, fromRev, toRev int64, withPrevKV bool) ([
 				prevKV = nil
 			}
 		}
+		et := EventPut
+		if r.delete {
+			et = EventDelete
+		}
 		events = append(events, Event{
-			KV:      kv,
-			PrevKV:  prevKV,
-			Deleted: r.delete,
+			Type:   et,
+			KV:     kv,
+			PrevKV: prevKV,
 		})
 	}
 	return events, iter.Error()
