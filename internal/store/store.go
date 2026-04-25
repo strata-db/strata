@@ -650,8 +650,15 @@ type Event struct {
 // The channel is closed when ctx is cancelled. When withPrevKV is false,
 // emitted events have PrevKV == nil; this avoids one Pebble lookup per
 // non-create event in hot watch paths.
+//
+// The channel buffer is intentionally small. Backpressure should flow back to
+// scanLog quickly so a slow consumer doesn't accumulate large amounts of
+// converted events in memory and doesn't delay compaction by holding live
+// references to old revisions. The etcd handler's drain loop coalesces
+// whatever is immediately available into one WatchResponse, so a small buffer
+// still amortises gRPC Send overhead.
 func (s *Store) Watch(ctx context.Context, prefix string, startRev int64, withPrevKV bool) (<-chan Event, error) {
-	ch := make(chan Event, 1024)
+	ch := make(chan Event, 64)
 	s.watcherWg.Add(1)
 	go s.watchLoop(ctx, prefix, startRev, withPrevKV, ch)
 	return ch, nil

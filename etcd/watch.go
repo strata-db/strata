@@ -14,9 +14,11 @@ import (
 
 // Maximum events coalesced into a single WatchResponse frame. Real etcd
 // batches events on the wire; per-event Send is the dominant cost under high
-// churn. 256 keeps frame size bounded while letting bursty scanLog output
-// ship in one round trip.
-const watchMaxBatch = 256
+// churn. The drain loop only takes events that are *immediately* available
+// from the upstream channel (buffered in t4.Node.Watch), so this is a soft
+// cap aligned with the upstream buffer — slow clients don't accumulate
+// hundreds of events here.
+const watchMaxBatch = 64
 
 // Watch implements WatchServer.Watch (bidirectional streaming).
 //
