@@ -70,6 +70,24 @@ var (
 
 	// ObjectStoreDuration measures object storage operation latency by op type.
 	ObjectStoreDuration *prometheus.HistogramVec
+
+	// WatchActive tracks currently active watch subscriptions.
+	WatchActive prometheus.Gauge
+
+	// WatchActivePrefixes tracks the number of distinct prefixes with active
+	// watch subscriptions. It intentionally avoids raw-prefix labels to keep
+	// metric cardinality bounded under Kubernetes workloads.
+	WatchActivePrefixes prometheus.Gauge
+
+	// WatchScanDuration measures time spent scanning revision logs for watches.
+	WatchScanDuration prometheus.Histogram
+
+	// WatchScanRevisionSpan measures the revision span scanned by watch loops.
+	WatchScanRevisionSpan prometheus.Histogram
+
+	// WatchScanEntriesTotal counts revision-log entries scanned by watch loops
+	// and entries that matched the watch prefix.
+	WatchScanEntriesTotal *prometheus.CounterVec
 )
 
 var once sync.Once
@@ -186,6 +204,33 @@ func Register(reg prometheus.Registerer) {
 			Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
 		}, []string{"op"})
 
+		WatchActive = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "t4_watch_active",
+			Help: "Currently active watch subscriptions.",
+		})
+
+		WatchActivePrefixes = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "t4_watch_active_prefixes",
+			Help: "Number of distinct prefixes with active watch subscriptions.",
+		})
+
+		WatchScanDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "t4_watch_scan_duration_seconds",
+			Help:    "Duration of revision-log scans performed by watch loops.",
+			Buckets: []float64{.0001, .0005, .001, .005, .01, .025, .05, .1, .25, .5, 1},
+		})
+
+		WatchScanRevisionSpan = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "t4_watch_scan_revision_span",
+			Help:    "Number of revisions covered by each watch-loop scan.",
+			Buckets: []float64{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000},
+		})
+
+		WatchScanEntriesTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "t4_watch_scan_entries_total",
+			Help: "Revision-log entries scanned by watch loops, labelled by scanned or matched.",
+		}, []string{"result"})
+
 		reg.MustRegister(
 			WritesTotal,
 			WriteErrors,
@@ -206,6 +251,11 @@ func Register(reg prometheus.Registerer) {
 			FollowerLag,
 			ObjectStoreOpsTotal,
 			ObjectStoreDuration,
+			WatchActive,
+			WatchActivePrefixes,
+			WatchScanDuration,
+			WatchScanRevisionSpan,
+			WatchScanEntriesTotal,
 		)
 	})
 }

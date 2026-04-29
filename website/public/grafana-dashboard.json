@@ -400,13 +400,151 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "id": 60,
+      "title": "Watch Performance",
+      "type": "row"
+    },
+    {
+      "id": 61,
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 15 },
+      "type": "stat",
+      "title": "Active Watches",
+      "description": "Currently active watch subscriptions and distinct watched prefixes.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(t4_watch_active{job=\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "watches",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(t4_watch_active_prefixes{job=\"$job\", instance=~\"$instance\"})",
+          "legendFormat": "prefixes",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "fixed", "fixedColor": "blue" },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 62,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "type": "timeseries",
+      "title": "Watch Scan Latency (p50 / p95 / p99)",
+      "description": "Latency spent scanning revision logs for watch delivery.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(t4_watch_scan_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(t4_watch_scan_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(t4_watch_scan_duration_seconds_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 63,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "type": "timeseries",
+      "title": "Watch Revision Span (p50 / p95 / p99)",
+      "description": "Number of revisions covered by watch scan loops.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(t4_watch_scan_revision_span_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(t4_watch_scan_revision_span_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(t4_watch_scan_revision_span_bucket{job=\"$job\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 64,
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 23 },
+      "type": "timeseries",
+      "title": "Watch Scan Entries",
+      "description": "Revision-log entries scanned vs entries matching watch prefixes.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(t4_watch_scan_entries_total{job=\"$job\", instance=~\"$instance\"}[2m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
       "id": 20,
       "title": "Replication",
       "type": "row"
     },
     {
       "id": 21,
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
       "type": "timeseries",
       "title": "Follower Lag",
       "description": "Revision lag per connected follower. 0 = fully caught up. Absent = no followers.",
@@ -441,7 +579,7 @@
     },
     {
       "id": 22,
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
       "type": "timeseries",
       "title": "Forwarded Writes",
       "description": "Write operations forwarded from follower to leader per second.",
@@ -467,7 +605,7 @@
     },
     {
       "id": 23,
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
       "type": "timeseries",
       "title": "Forward Latency (p50 / p95 / p99)",
       "description": "Round-trip latency for writes forwarded from follower to leader.",
@@ -503,14 +641,14 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
       "id": 30,
       "title": "WAL & Checkpoints",
       "type": "row"
     },
     {
       "id": 31,
-      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 24 },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 41 },
       "type": "timeseries",
       "title": "WAL Upload Rate",
       "description": "WAL segments uploaded to S3 per minute.",
@@ -536,7 +674,7 @@
     },
     {
       "id": 32,
-      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 24 },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 41 },
       "type": "timeseries",
       "title": "WAL Upload Errors",
       "description": "Failed WAL segment uploads. Should be 0.",
@@ -563,7 +701,7 @@
     },
     {
       "id": 33,
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 24 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 41 },
       "type": "timeseries",
       "title": "WAL Upload Duration (p50 / p95 / p99)",
       "description": "Time to upload a WAL segment to S3.",
@@ -599,7 +737,7 @@
     },
     {
       "id": 34,
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 24 },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 41 },
       "type": "timeseries",
       "title": "Checkpoints Written",
       "description": "Leader checkpoints written to S3 (cumulative and rate).",
@@ -625,14 +763,14 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
       "id": 40,
       "title": "Object Store (S3)",
       "type": "row"
     },
     {
       "id": 41,
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 33 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 50 },
       "type": "timeseries",
       "title": "S3 Operation Rate",
       "description": "Object store operations per second by op type.",
@@ -658,7 +796,7 @@
     },
     {
       "id": 42,
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 33 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 50 },
       "type": "timeseries",
       "title": "S3 Error Rate",
       "description": "Object store errors as a fraction of total S3 operations, by op type.",
@@ -696,7 +834,7 @@
     },
     {
       "id": 43,
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 33 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 50 },
       "type": "timeseries",
       "title": "S3 Latency (p50 / p95 / p99)",
       "description": "Object store operation latency percentiles (all ops combined).",

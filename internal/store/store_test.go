@@ -5,6 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/t4db/t4/internal/metrics"
 	"github.com/t4db/t4/internal/wal"
 )
 
@@ -362,6 +365,69 @@ func TestWatchCancelStopsChannel(t *testing.T) {
 	case <-timer.C:
 		t.Error("channel did not close after context cancel")
 	}
+}
+
+func TestWatchMetrics(t *testing.T) {
+	metrics.Register(prometheus.NewRegistry())
+	s := openMem(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch1, err := s.Watch(ctx, "/metrics/", 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch2, err := s.Watch(ctx, "/metrics/", 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := testutil.ToFloat64(metrics.WatchActive); got != 2 {
+		t.Fatalf("active watches: want 2 got %v", got)
+	}
+	if got := testutil.ToFloat64(metrics.WatchActivePrefixes); got != 1 {
+		t.Fatalf("active watch prefixes: want 1 got %v", got)
+	}
+
+	apply(t, s,
+		createEntry(1, "/metrics/a", []byte("1")),
+		createEntry(2, "/other/a", []byte("2")),
+	)
+
+	for i, ch := range []<-chan Event{ch1, ch2} {
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatalf("watcher %d did not receive matching event", i)
+		}
+	}
+
+	waitForMetric(t, func() float64 {
+		return testutil.ToFloat64(metrics.WatchScanEntriesTotal.WithLabelValues("scanned"))
+	}, func(v float64) bool { return v > 0 }, "scanned watch entries")
+	waitForMetric(t, func() float64 {
+		return testutil.ToFloat64(metrics.WatchScanEntriesTotal.WithLabelValues("matched"))
+	}, func(v float64) bool { return v > 0 }, "matched watch entries")
+
+	cancel()
+	waitForMetric(t, func() float64 {
+		return testutil.ToFloat64(metrics.WatchActive)
+	}, func(v float64) bool { return v == 0 }, "active watches after cancel")
+	waitForMetric(t, func() float64 {
+		return testutil.ToFloat64(metrics.WatchActivePrefixes)
+	}, func(v float64) bool { return v == 0 }, "active watch prefixes after cancel")
+}
+
+func waitForMetric(t *testing.T, get func() float64, ok func(float64) bool, name string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		v := get()
+		if ok(v) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for %s, last value %v", name, get())
 }
 
 // ── WaitForRevision ───────────────────────────────────────────────────────────
