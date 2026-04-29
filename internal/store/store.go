@@ -11,6 +11,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/vfs"
+	"github.com/t4db/t4/internal/metrics"
 	"github.com/t4db/t4/internal/wal"
 )
 
@@ -33,12 +34,14 @@ type Store struct {
 	currentRev int64
 	compactRev int64
 
-	// mu protects notify and the watchpoint map.
+	// mu protects notify and watch prefix accounting.
 	mu        sync.RWMutex
 	notify    chan struct{} // closed and replaced on each revision advance
 	closed    chan struct{} // closed once when Store.Close is called
 	closeOnce sync.Once
 	watcherWg sync.WaitGroup // tracks active watchLoop goroutines
+
+	watchPrefixes map[string]int
 }
 
 // lockRetryTimeout is how long Open retries when another process holds the
@@ -64,7 +67,12 @@ func Open(dir string, log logger, extraOpts ...func(*pebble.Options)) (*Store, e
 	for {
 		db, err := pebble.Open(dir, opts)
 		if err == nil {
-			s := &Store{db: db, notify: make(chan struct{}), closed: make(chan struct{})}
+			s := &Store{
+				db:            db,
+				notify:        make(chan struct{}),
+				closed:        make(chan struct{}),
+				watchPrefixes: make(map[string]int),
+			}
 			if err := s.loadMeta(); err != nil {
 				db.Close()
 				return nil, err
@@ -607,7 +615,7 @@ func (s *Store) History(key string) ([]Event, error) {
 	if key == "" {
 		return nil, fmt.Errorf("store: history key must not be empty")
 	}
-	events, err := s.scanLog("", 1, atomic.LoadInt64(&s.currentRev), true)
+	events, _, err := s.scanLog("", 1, atomic.LoadInt64(&s.currentRev), true)
 	if err != nil {
 		return nil, err
 	}
@@ -635,7 +643,8 @@ func (s *Store) Changes(prefix string, fromRev, toRev int64) ([]Event, error) {
 	if toRev > currentRev {
 		toRev = currentRev
 	}
-	return s.scanLog(prefix, fromRev, toRev, true)
+	events, _, err := s.scanLog(prefix, fromRev, toRev, true)
+	return events, err
 }
 
 // --- Watch ---
@@ -668,13 +677,46 @@ type Event struct {
 // still amortises gRPC Send overhead.
 func (s *Store) Watch(ctx context.Context, prefix string, startRev int64, withPrevKV bool) (<-chan Event, error) {
 	ch := make(chan Event, 64)
+	unregister := s.registerWatch(prefix)
 	s.watcherWg.Add(1)
-	go s.watchLoop(ctx, prefix, startRev, withPrevKV, ch)
+	go s.watchLoop(ctx, prefix, startRev, withPrevKV, ch, unregister)
 	return ch, nil
 }
 
-func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, withPrevKV bool, ch chan<- Event) {
+func (s *Store) registerWatch(prefix string) func() {
+	s.mu.Lock()
+	if s.watchPrefixes == nil {
+		s.watchPrefixes = make(map[string]int)
+	}
+	s.watchPrefixes[prefix]++
+	prefixes := len(s.watchPrefixes)
+	s.mu.Unlock()
+
+	if metrics.WatchActive != nil {
+		metrics.WatchActive.Inc()
+		metrics.WatchActivePrefixes.Set(float64(prefixes))
+	}
+
+	return func() {
+		s.mu.Lock()
+		if n := s.watchPrefixes[prefix]; n <= 1 {
+			delete(s.watchPrefixes, prefix)
+		} else {
+			s.watchPrefixes[prefix] = n - 1
+		}
+		prefixes := len(s.watchPrefixes)
+		s.mu.Unlock()
+
+		if metrics.WatchActive != nil {
+			metrics.WatchActive.Dec()
+			metrics.WatchActivePrefixes.Set(float64(prefixes))
+		}
+	}
+}
+
+func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, withPrevKV bool, ch chan<- Event, unregister func()) {
 	defer s.watcherWg.Done()
+	defer unregister()
 	defer close(ch)
 
 	nextRev := startRev + 1
@@ -686,10 +728,12 @@ func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, wi
 		curRev := atomic.LoadInt64(&s.currentRev)
 
 		// Scan the log for events in [nextRev, curRev].
-		events, err := s.scanLog(prefix, nextRev, curRev, withPrevKV)
+		start := time.Now()
+		events, scanned, err := s.scanLog(prefix, nextRev, curRev, withPrevKV)
 		if err != nil {
 			return
 		}
+		recordWatchScanMetrics(time.Since(start), nextRev, curRev, scanned, len(events))
 		for _, ev := range events {
 			select {
 			case ch <- ev:
@@ -703,10 +747,20 @@ func (s *Store) watchLoop(ctx context.Context, prefix string, startRev int64, wi
 	}
 }
 
+func recordWatchScanMetrics(d time.Duration, fromRev, toRev int64, scanned, matched int) {
+	if metrics.WatchScanDuration == nil {
+		return
+	}
+	metrics.WatchScanDuration.Observe(d.Seconds())
+	metrics.WatchScanRevisionSpan.Observe(float64(toRev - fromRev + 1))
+	metrics.WatchScanEntriesTotal.WithLabelValues("scanned").Add(float64(scanned))
+	metrics.WatchScanEntriesTotal.WithLabelValues("matched").Add(float64(matched))
+}
+
 // scanLog reads log entries in [fromRev, toRev] and returns events for keys
-// matching prefix. When withPrevKV is false, the per-event PrevKV lookup is
-// skipped.
-func (s *Store) scanLog(prefix string, fromRev, toRev int64, withPrevKV bool) ([]Event, error) {
+// matching prefix plus the number of log records scanned. When withPrevKV is
+// false, the per-event PrevKV lookup is skipped.
+func (s *Store) scanLog(prefix string, fromRev, toRev int64, withPrevKV bool) ([]Event, int, error) {
 	lower := logKey(fromRev)
 	upper := logKey(toRev + 1)
 
@@ -715,16 +769,18 @@ func (s *Store) scanLog(prefix string, fromRev, toRev int64, withPrevKV bool) ([
 		UpperBound: upper,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("store: scan log iter: %w", err)
+		return nil, 0, fmt.Errorf("store: scan log iter: %w", err)
 	}
 	defer iter.Close()
 
 	var events []Event
+	var scanned int
 	for iter.First(); iter.Valid(); iter.Next() {
+		scanned++
 		rev := decodeLogKey(iter.Key())
 		r, err := unmarshalRecord(iter.Value())
 		if err != nil {
-			return nil, err
+			return nil, scanned, err
 		}
 		if prefix != "" && (len(r.key) < len(prefix) || r.key[:len(prefix)] != prefix) {
 			continue
@@ -755,5 +811,5 @@ func (s *Store) scanLog(prefix string, fromRev, toRev int64, withPrevKV bool) ([
 			PrevKV: prevKV,
 		})
 	}
-	return events, iter.Error()
+	return events, scanned, iter.Error()
 }

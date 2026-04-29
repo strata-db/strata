@@ -377,12 +377,13 @@ To import it:
 3. Select your Prometheus datasource when prompted.
 4. Set the **job** variable to match the scrape job name for your T4 instances (default: `t4`).
 
-The dashboard contains five sections:
+The dashboard contains six sections:
 
 | Section | Panels |
 |---|---|
 | **Cluster Health** | Leader count (split-brain indicator), current revision, node roles, max follower lag, elections/hr, resyncs/hr |
 | **Write Performance** | Throughput by op type, error rate, p50/p95/p99 write latency |
+| **Watch Performance** | Active watches/prefixes, p50/p95/p99 watch scan latency, revision span, scanned vs matched log entries |
 | **Replication** | Per-follower lag over time, forwarded write rate, forward round-trip latency |
 | **WAL & Checkpoints** | Upload rate, upload errors, upload duration, checkpoint frequency |
 | **Object Store (S3)** | Op rate by type, error rate, p50/p95/p99 latency |
@@ -408,6 +409,11 @@ The dashboard contains five sections:
 | `t4_follower_resyncs_total` | counter | `reason` | Full resync events triggered on followers (`behind_leader_start` / `ring_buffer_miss` / `stream_gap`) |
 | `t4_follower_lag_revisions` | gauge | `follower_id` | Revisions the follower is behind the leader (0 = fully caught up); absent when no followers connected |
 | `t4_auth_attempts_total` | counter | `result` | Authentication attempts (`success` / `fail` / `locked`) |
+| `t4_watch_active` | gauge | — | Currently active watch subscriptions |
+| `t4_watch_active_prefixes` | gauge | — | Distinct prefixes with active watch subscriptions |
+| `t4_watch_scan_duration_seconds` | histogram | — | Time spent scanning revision logs for watch delivery |
+| `t4_watch_scan_revision_span` | histogram | — | Revision span covered by each watch scan |
+| `t4_watch_scan_entries_total` | counter | `result` | Watch scan entries by result (`scanned` / `matched`) |
 
 `op` label values: `put`, `create`, `update`, `delete`, `compact`.
 

@@ -817,11 +817,240 @@
     },
     {
       "collapsed": false,
+      "id": 60,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
         "y": 19
+      },
+      "type": "row",
+      "title": "Watch Performance"
+    },
+    {
+      "id": 61,
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 0,
+        "y": 20
+      },
+      "type": "stat",
+      "title": "Active Watches",
+      "description": "Currently active watch subscriptions and distinct watched prefixes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum(t4_watch_active{job=\"$job\", app_kubernetes_io_instance=\"$cluster\", instance=~\"$instance\"})",
+          "legendFormat": "watches",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(t4_watch_active_prefixes{job=\"$job\", app_kubernetes_io_instance=\"$cluster\", instance=~\"$instance\"})",
+          "legendFormat": "prefixes",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "center",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 62,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 20
+      },
+      "type": "timeseries",
+      "title": "Watch Scan Latency (p50 / p95 / p99)",
+      "description": "Latency spent scanning revision logs for watch delivery.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(t4_watch_scan_duration_seconds_bucket{job=\"$job\", app_kubernetes_io_instance=\"$cluster\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(t4_watch_scan_duration_seconds_bucket{job=\"$job\", app_kubernetes_io_instance=\"$cluster\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(t4_watch_scan_duration_seconds_bucket{job=\"$job\", app_kubernetes_io_instance=\"$cluster\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5
+          },
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 63,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 20
+      },
+      "type": "timeseries",
+      "title": "Watch Revision Span (p50 / p95 / p99)",
+      "description": "Number of revisions covered by watch scan loops.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(t4_watch_scan_revision_span_bucket{job=\"$job\", app_kubernetes_io_instance=\"$cluster\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(t4_watch_scan_revision_span_bucket{job=\"$job\", app_kubernetes_io_instance=\"$cluster\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(t4_watch_scan_revision_span_bucket{job=\"$job\", app_kubernetes_io_instance=\"$cluster\", instance=~\"$instance\"}[2m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5
+          },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 64,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 28
+      },
+      "type": "timeseries",
+      "title": "Watch Scan Entries",
+      "description": "Revision-log entries scanned vs entries matching watch prefixes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(t4_watch_scan_entries_total{job=\"$job\", app_kubernetes_io_instance=\"$cluster\", instance=~\"$instance\"}[2m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 36
       },
       "id": 20,
       "title": "Replication",
@@ -833,7 +1062,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 20
+        "y": 37
       },
       "type": "timeseries",
       "title": "Follower Lag",
@@ -900,7 +1129,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 20
+        "y": 37
       },
       "type": "timeseries",
       "title": "Forwarded Writes",
@@ -949,7 +1178,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 20
+        "y": 37
       },
       "type": "timeseries",
       "title": "Forward Latency (p50 / p95 / p99)",
@@ -1010,7 +1239,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 28
+        "y": 45
       },
       "datasource": {
         "type": "prometheus",
@@ -1060,7 +1289,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 28
+        "y": 45
       },
       "datasource": {
         "type": "prometheus",
@@ -1099,7 +1328,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 37
+        "y": 54
       },
       "id": 30,
       "title": "WAL & Checkpoints",
@@ -1111,7 +1340,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 38
+        "y": 55
       },
       "type": "timeseries",
       "title": "WAL Upload Rate",
@@ -1159,7 +1388,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 38
+        "y": 55
       },
       "type": "timeseries",
       "title": "WAL Upload Errors",
@@ -1208,7 +1437,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 38
+        "y": 55
       },
       "type": "timeseries",
       "title": "WAL Upload Duration (p50 / p95 / p99)",
@@ -1267,7 +1496,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 38
+        "y": 55
       },
       "type": "timeseries",
       "title": "Checkpoints Written",
@@ -1315,7 +1544,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 46
+        "y": 63
       },
       "id": 40,
       "title": "Object Store (S3)",
@@ -1327,7 +1556,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 47
+        "y": 64
       },
       "type": "timeseries",
       "title": "S3 Operation Rate",
@@ -1376,7 +1605,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 47
+        "y": 64
       },
       "type": "timeseries",
       "title": "S3 Error Rate",
@@ -1442,7 +1671,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 47
+        "y": 64
       },
       "type": "timeseries",
       "title": "S3 Latency (p50 / p95 / p99)",
