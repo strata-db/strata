@@ -30,19 +30,41 @@ description: All t4.Config fields and CLI flags for the T4 standalone binary.
 | `PeerClientTLS`       | `credentials.TransportCredentials` | `nil`            | mTLS credentials for the peer gRPC client (follower side).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `MetricsAddr`         | `string`                           | `""`             | HTTP address for `/metrics`, `/healthz`, `/readyz`. Empty = disabled.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `ReadConsistency`     | `ReadConsistency`                  | `"linearizable"` | Consistency guarantee for reads served by the etcd adapter. `"linearizable"` (default): each read syncs to the leader's current revision before returning, ensuring no stale reads. `"serializable"`: reads are served from local Pebble state without a round-trip to the leader; lower latency but may return slightly stale data on followers.                                                                                                                                                                                                                                                                                                                           |
+| `PebbleOptions`       | `[]func(*pebble.Options)`          | `nil`            | Expert hook for appending Pebble options before opening the local state machine. Production deployments normally leave this empty.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `WAL`                 | `WALWriter`                        | `nil`            | Expert hook for replacing the filesystem WAL. Intended for constrained runtimes and tests. Production deployments normally leave this nil.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `Logger`              | `Logger`                           | logrus standard logger | Receives all T4 log output. Set this in embedded mode to control destination, level, and format. Use `t4.NoopLogger` to silence T4 logs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `MetricsRegisterer`   | `prometheus.Registerer`            | `prometheus.DefaultRegisterer` | Prometheus registerer used for T4 metrics. Pass a custom registry to isolate T4 metrics when embedding.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 ### Using a custom S3-compatible store
 
-`object.Store` is a four-method interface (`Put`, `Get`, `Delete`, `List`). Implement it to use any storage backend.
+`object.Store` is a five-method interface (`Put`, `Get`, `Delete`, `DeleteMany`, `List`). Implement it to use any storage backend.
 
 ```go
 type Store interface {
     Put(ctx context.Context, key string, r io.Reader) error
     Get(ctx context.Context, key string) (io.ReadCloser, error)
     Delete(ctx context.Context, key string) error
+    DeleteMany(ctx context.Context, keys []string) error
     List(ctx context.Context, prefix string) ([]string, error)
 }
 ```
+
+`List` must return keys in lexicographic order. `Delete` and `DeleteMany` must not fail when keys are already absent.
+
+Advanced embedders can also replace the WAL by implementing `WALWriter`:
+
+```go
+type WALWriter interface {
+    Open(dir string, term uint64, startRev int64) error
+    ReplayLocal(db wal.RecoveryStore, afterRev int64) error
+    Append(e *wal.Entry) error
+    AppendBatch(ctx context.Context, entries []*wal.Entry) error
+    SealAndFlush(nextRev int64) error
+    Close() error
+}
+```
+
+Custom WAL implementations must preserve the same durability ordering as the default filesystem WAL.
 
 `pkg/object` provides `NewS3Store` (AWS SDK v2) and `NewMem` (in-memory, for tests).
 

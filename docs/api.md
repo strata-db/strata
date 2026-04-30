@@ -138,11 +138,30 @@ Reads are always served from the local Pebble instance (leader or follower).
 // Get returns the current value for key, or nil if the key does not exist.
 Get(key string) (*KeyValue, error)
 
+// Exists reports whether key exists.
+Exists(key string) (bool, error)
+
 // List returns all live keys whose names begin with prefix, in lexicographic order.
 List(prefix string) ([]*KeyValue, error)
 
+// ListLimit returns up to limit live keys whose names begin with prefix.
+// A limit <= 0 returns all matching keys.
+ListLimit(prefix string, limit int64) ([]*KeyValue, error)
+
 // Count returns the number of live keys whose names begin with prefix.
 Count(prefix string) (int64, error)
+```
+
+### Linearizable reads
+
+The helpers below sync a follower to the leader's current revision before serving the read locally. On the leader and in single-node mode, the sync is a no-op.
+
+```go
+LinearizableGet(ctx context.Context, key string) (*KeyValue, error)
+LinearizableExists(ctx context.Context, key string) (bool, error)
+LinearizableList(ctx context.Context, prefix string) ([]*KeyValue, error)
+LinearizableListLimit(ctx context.Context, prefix string, limit int64) ([]*KeyValue, error)
+LinearizableCount(ctx context.Context, prefix string) (int64, error)
 ```
 
 ---
@@ -155,6 +174,10 @@ Count(prefix string) (int64, error)
 // startRev=N means replay events from revision N (inclusive).
 // The returned channel is closed when ctx is cancelled or the node shuts down.
 Watch(ctx context.Context, prefix string, startRev int64) (<-chan Event, error)
+
+// WithPrevKV requests previous key/value data on update and delete events.
+// It adds one Pebble lookup per non-create event.
+WithPrevKV() WatchOption
 ```
 
 ### Event
@@ -182,6 +205,10 @@ const (
 // WaitForRevision blocks until the node has applied at least rev, then returns nil.
 // Returns ctx.Err() if the context is cancelled first.
 WaitForRevision(ctx context.Context, rev int64) error
+
+// Flush seals the current WAL segment and flushes Pebble's memtable.
+// Checkpointing uses the same ordering before writing a checkpoint.
+Flush() error
 ```
 
 Useful when a follower needs to serve a read that is consistent with a write
@@ -220,6 +247,8 @@ type KeyValue struct {
 ```go
 var ErrKeyExists error  // Create: key already present
 var ErrNotLeader error  // write on a follower when the leader is unreachable
+var ErrClosed error     // operation attempted after Close
+var ErrCompacted error  // requested watch revision has been compacted
 ```
 
 Both are suitable for use with `errors.Is`.

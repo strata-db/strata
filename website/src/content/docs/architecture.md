@@ -54,7 +54,9 @@ S3 bucket/<prefix>/
   branches/<id>                                Branch registry entry (JSON)
 ```
 
-SST files are keyed by the first 16 hex characters of their SHA-256 content hash. Identical content is stored once regardless of how many checkpoints reference it. Branch nodes add an `AncestorSSTFiles` list to their checkpoint index that points at SSTs in the source prefix — those files are never copied.
+SST files are keyed by the first 16 hex characters of their SHA-256 content hash. Identical content is stored once regardless of how many checkpoints reference it. Branch nodes add an `ancestor_sst_files` list to their checkpoint index that points at SSTs in the source prefix — those files are never copied.
+
+For exact JSON schemas and binary WAL frame layouts, see the [v1 Compatibility Contract](/v1-compatibility/).
 
 ---
 
@@ -198,7 +200,7 @@ Branching lets you fork a database at a checkpoint without copying SST files in 
 
 1. **Register** — `Fork(ctx, sourceStore, branchID)` reads the latest (or a specified) checkpoint manifest from the source store and writes a `branches/<id>` registry entry to the source store. This entry records the checkpoint key being forked from.
 2. **Start** — Open a new t4 node with `BranchPoint{SourceStore, CheckpointKey}`. On first boot, `RestoreBranch` downloads SSTs from the source store and Pebble metadata from the source checkpoint. The branch's own store prefix starts empty.
-3. **Diverge** — New SSTs produced by the branch are uploaded to the branch's own prefix. The checkpoint index for the branch records `SSTFiles` (its own SSTs) and `AncestorSSTFiles` (SSTs inherited from the source). Ancestor SSTs are never re-uploaded.
+3. **Diverge** — New SSTs produced by the branch are uploaded to the branch's own prefix. The checkpoint index for the branch records `sst_files` (its own SSTs) and `ancestor_sst_files` (SSTs inherited from the source). Ancestor SSTs are never re-uploaded.
 4. **GC coordination** — The source's GC phase reads the branch registry before deleting anything. `GCCheckpoints` keeps the pinned checkpoint directory (manifest + index) intact even if it falls outside the keep-N window. `GCOrphanSSTs` keeps all SST files referenced by any live branch. Both source checkpoint objects and SSTs are preserved for as long as the branch entry exists.
 5. **Unfork** — `Unfork(ctx, sourceStore, branchID)` removes the registry entry. The next source GC cycle can reclaim SSTs that are no longer referenced by any live checkpoint or branch.
 
@@ -208,11 +210,11 @@ Entries are stored at `branches/<id>` in the source store as JSON:
 
 ```json
 {
-  "id": "my-branch",
-  "checkpoint_key": "checkpoint/0000000001/00000000000000000100/manifest.json",
-  "created_at": "2024-01-15T10:30:00Z"
+  "ancestor_checkpoint_key": "checkpoint/0000000001/00000000000000000100/manifest.json"
 }
 ```
+
+The branch id is the object key suffix after `branches/`; it is not duplicated inside the JSON body.
 
 ---
 

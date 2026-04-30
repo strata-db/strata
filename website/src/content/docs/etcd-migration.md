@@ -7,6 +7,8 @@ T4 implements the core etcd v3 gRPC API — KV, Watch, Lease, and Auth. In most 
 `t4 run` and pointing your existing clients at the new endpoint is all that's needed. Some Maintenance and Cluster RPCs
 are not implemented; see the tables below for the full picture.
 
+For v1, these unsupported maintenance and cluster features are intentional non-goals unless a concrete compatibility target requires them. See the [v1 Compatibility Contract](/v1-compatibility/#etcd-compatibility).
+
 ---
 
 ## Compatibility
