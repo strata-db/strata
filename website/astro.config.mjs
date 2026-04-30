@@ -95,6 +95,7 @@ export default defineConfig({
 					label: 'Reference',
 					items: [
 						{ label: 'Architecture', slug: 'architecture' },
+						{ label: 'v1 Compatibility', slug: 'v1-compatibility' },
 						{ label: 'Consistency Model', slug: 'consistency' },
 						{ label: 'Failure Scenarios', slug: 'failure-scenarios' },
 						{ label: 'Benchmarks', slug: 'benchmarks' },

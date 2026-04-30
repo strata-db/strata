@@ -1,0 +1,5 @@
+{{- $clientFacingTLSEnabled := eq (include "t4.clientFacingTLSEnabled" .) "true" -}}
+{{- $clientFacingTLSRequireClientCert := eq (include "t4.clientFacingTLSRequireClientCert" .) "true" -}}
+{{- if and $clientFacingTLSRequireClientCert (not $clientFacingTLSEnabled) -}}
+{{- fail "tls.clientCertAuth requires tls.enabled=true" -}}
+{{- end -}}
