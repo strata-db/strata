@@ -3,7 +3,7 @@
 [![CI](https://github.com/t4db/t4/actions/workflows/ci.yml/badge.svg)](https://github.com/t4db/t4/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/t4db/t4.svg)](https://pkg.go.dev/github.com/t4db/t4)
 [![Go Report Card](https://goreportcard.com/badge/github.com/t4db/t4)](https://goreportcard.com/report/github.com/t4db/t4)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-t4db.github.io-green)](https://t4db.github.io/t4/)
 
 T4 is an open-source key-value database built on object storage.
